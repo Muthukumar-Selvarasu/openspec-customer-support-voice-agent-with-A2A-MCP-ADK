@@ -1,0 +1,24 @@
+---
+description: Record each work session in the Obsidian project for this repo.
+alwaysApply: true
+---
+
+# Obsidian session log
+
+Project name (do not rename): `openspec-customer-support-voice-agent-with-A2A-MCP-ADK`
+
+Vault folder:
+
+`/Users/muthukumars/Library/CloudStorage/GoogleDrive-muthukumar.se@gmail.com/My Drive/Obsidian-Notes/Muthu/openspec-customer-support-voice-agent-with-A2A-MCP-ADK/`
+
+This vault is a running work record. Project documents will be written from it later.
+
+After each work session:
+
+1. One note per work session, not per small step. If several steps happened in the same go, keep them in the current session note.
+2. Add `Session NN - <title>.md` only when a new session actually starts. Copy the frontmatter shape from Session 00.
+3. Link the hub: `[[openspec-customer-support-voice-agent-with-A2A-MCP-ADK]]`.
+4. Write what we did and **Where things stand**.
+5. Keep the hub **Sessions** list in sync.
+6. Record only what happened. Do not invent a plan, roadmap, or task list.
+7. Never write secrets, `.env` values, or API keys into the vault.
