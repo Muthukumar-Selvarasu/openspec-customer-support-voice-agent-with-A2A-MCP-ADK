@@ -34,6 +34,22 @@ Otherwise, with no root, what happens next depends on how this workflow was reac
 
 In both branches, never create the root as a side effect: do not run `openspec init` until the user asks for it, do not hand-create `openspec/` files, and do not let a command create it.
 
+**FDE gate:** Before creating a change, confirm FDE Stages 0–3 artifacts exist. Check these paths (file existence only; do not write them):
+
+- `docs/ENGAGEMENT.md` (Stage 0 — `/opsx-fde-stage-0`)
+- `docs/01-discovery/discovery-report.md`
+- `docs/01-discovery/data-audit.md`
+- `docs/01-discovery/workflow-map.md`
+- `docs/01-discovery/access-security-scoping.md` (Stage 1 — `/opsx-fde-stage-1`)
+- `docs/02-problem-metrics/problem-brief.md`
+- `docs/02-problem-metrics/success-metrics.md`
+- `docs/02-problem-metrics/eval-rubric.md` (Stage 2 — `/opsx-fde-stage-2`)
+- `docs/03-poc/poc-plan.md`
+- `docs/03-poc/poc-validation-log.md`
+- `docs/03-poc/poc-demo-notes.md` (Stage 3 — `/opsx-fde-stage-3`)
+
+If any are missing, stop and tell the user which `/opsx-fde-stage-N` to run for the first missing stage. Do not propose a code change until FDE Stages 0–3 are done. Do not write the missing FDE docs from this command.
+
 **Input**: The argument after `/opsx-propose` is the change name (kebab-case), OR a description of what the user wants to build.
 
 **Steps**
@@ -70,6 +86,8 @@ In both branches, never create the root as a side effect: do not run `openspec i
    Otherwise, omit `--schema` to preserve the configured default.
 
 4. **Create the change directory**
+
+   Re-check the **FDE gate** above. If any Stage 0–3 file is missing, stop; do not run `openspec new change`.
 
    Choose one schema form below. If a registered store is selected, append `--store "<store-id>"` to that command and each later OpenSpec command shown below that accepts `--store`.
 

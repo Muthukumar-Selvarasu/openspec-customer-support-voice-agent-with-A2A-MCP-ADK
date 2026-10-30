@@ -4,29 +4,21 @@ schema: spec-driven
 # Add only constraints that should guide OpenSpec artifacts and workflows.
 # Include constraints an agent cannot infer by reading the code.
 # Keep general project documentation and discoverable codebase facts out.
-# Example:
-#   context: |
-#     Designs and tasks must cover Windows, macOS, and Linux
-#     Write all artifacts in Spanish
+context: |
+  Repo layout:
+  - docs/ FDE stages 0-3 (ENGAGEMENT.md, 01-discovery/, 02-problem-metrics/, 03-poc/)
+  - openspec/ spec-driven engine
+  - src/ application
+  - tests/ verification
 
 # Per-artifact rules (optional)
 # Add custom rules for specific artifacts.
-# Example:
-#   rules:
-#     proposal:
-#       - Keep proposals under 500 words
-#       - Always state what is out of scope
-#     tasks:
-#       - Break tasks into chunks of max 2 hours
-
-# Per-operation guidance (optional)
-# Add advisory guidance for how apply and archive work should be conducted.
-# This is separate from artifact rules above.
-# Example:
-#   operations:
-#     apply:
-#       guidance:
-#         - Keep test summaries concise
-#     archive:
-#       guidance:
-#         - Summarize the archive outcome before finishing
+rules:
+  proposal:
+    - Align with docs/ENGAGEMENT.md and docs/01-discovery, docs/02-problem-metrics, docs/03-poc
+  specs:
+    - Use SHALL/MUST requirements plus WHEN/THEN scenarios
+  design:
+    - Make URLs, hosts, and ports env-configurable with localhost defaults
+  tasks:
+    - Keep tasks as small verifiable steps with test commands
