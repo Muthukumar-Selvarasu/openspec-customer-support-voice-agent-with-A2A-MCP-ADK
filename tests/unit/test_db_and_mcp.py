@@ -195,6 +195,116 @@ def _podman(*args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+_DOCKER_CLI = re.compile(r"(^|[^\w.])docker(\s|$)")
+
+
+def _service_command(service: dict) -> str:
+    command = service.get("command")
+    if isinstance(command, list):
+        return " ".join(str(part) for part in command)
+    return str(command or "")
+
+
+def _tools_heredoc(script: str) -> str:
+    match = re.search(
+        r"cat > \.run/tools\.yaml <<'EOF'\n(.*?)\nEOF",
+        script,
+        flags=re.DOTALL,
+    )
+    assert match, "run.sh must generate .run/tools.yaml from a quoted heredoc"
+    return match.group(1)
+
+
+def test_run_sh_parses_and_calls_podman_compose() -> None:
+    script = _text("run.sh")
+    assert "podman compose" in script
+    assert "podman-compose" in script
+    assert "gen_config_files" in script
+    assert "podman compose run --rm cli python -m src.api.cli" in script
+    assert not _DOCKER_CLI.search(script)
+    installs = re.findall(r"pip install[^\n]*", script)
+    assert installs == [] or all("-r requirements.txt" in line for line in installs)
+    parsed = subprocess.run(
+        ["bash", "-n", str(ROOT / "run.sh")],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert parsed.returncode == 0, parsed.stderr
+
+
+def test_run_sh_generated_tools_keep_tenant_sql_on_compose_host() -> None:
+    script = _text("run.sh")
+    catalog = yaml.safe_load(_tools_heredoc(script))
+    source = catalog["sources"]["cs-postgres"]
+    assert source["host"] == "postgres"
+    assert source["host"] != "127.0.0.1"
+    lookup = catalog["tools"]["get-order-status"]
+    parameters = [item["name"] for item in lookup["parameters"]]
+    assert parameters == ["order_id", "customer_email"]
+    statement = " ".join(lookup["statement"].split())
+    assert "WHERE order_id = $1 AND customer_email = $2" in statement
+    assert "postgresql://toolbox_user:mysecretpassword@127.0.0.1:5432/toolbox_db" in script
+    assert "cat > .run/tools.yaml" in script
+    for leftover in FORBIDDEN_ENV_KEYS:
+        assert leftover not in script
+    committed = yaml.safe_load(_text("mcp_toolbox/tools.yaml"))
+    assert committed["sources"]["cs-postgres"]["host"] == "127.0.0.1"
+
+
+def test_run_sh_compose_publishes_cascade_ports_and_one_a2a_process() -> None:
+    compose_text = _text("compose.yaml")
+    assert not _DOCKER_CLI.search(compose_text)
+    compose = yaml.safe_load(compose_text)
+    services = compose["services"]
+    for name in ("postgres", "mcp-toolbox", "a2a", "web", "cli", "phoenix"):
+        assert name in services, name
+    assert services["postgres"]["environment"]["POSTGRES_DB"] == "toolbox_db"
+    assert "5432:5432" in services["postgres"]["ports"]
+    toolbox = _service_command(services["mcp-toolbox"])
+    assert toolbox == (
+        "npx -y @toolbox-sdk/server@1.5.0 --config /config/tools.yaml "
+        "--enable-api --address 0.0.0.0 --port 5000"
+    )
+    assert "node" in str(services["mcp-toolbox"]["image"])
+    run_servers = [
+        name
+        for name, service in services.items()
+        if "src.a2a.run_servers" in _service_command(service)
+    ]
+    assert run_servers == ["a2a"]
+    assert _service_command(services["a2a"]) == "python -m src.a2a.run_servers"
+    assert _service_command(services["web"]) == "python -m src.api.web"
+    assert _service_command(services["cli"]) == "python -m src.api.cli"
+    assert services["a2a"]["environment"]["A2A_JUDGE_HOST"] == "0.0.0.0"
+    assert services["a2a"]["environment"]["A2A_MASK_HOST"] == "0.0.0.0"
+    assert services["web"]["environment"]["HOST"] == "0.0.0.0"
+    published: list[str] = []
+    for service in services.values():
+        published.extend(str(item) for item in service.get("ports") or [])
+    for port in ("5432:5432", "5000:5000", "10002:10002", "10003:10003", "8000:8000"):
+        assert port in published, port
+
+
+def test_readme_documents_local_podman_launch() -> None:
+    readme = _text("README.md")
+    assert "podman compose" in readme
+    assert "./run.sh" in readme
+    assert "GOOGLE_API_KEY" in readme
+    assert "MEM0_API_KEY" in readme
+    assert "DATABASE_URL" in readme
+    assert re.search(r"\bHOST\b", readme)
+    assert re.search(r"\bPORT\b", readme)
+    assert "WEB_PORT" in readme
+    assert re.search(r"WEB_PORT.*alias of .*PORT", readme)
+    assert "podman machine start" in readme
+    assert "podman info" in readme
+    assert "08-railway-deploy" in readme
+    assert "does not need a cloud project" in readme
+    assert not _DOCKER_CLI.search(readme)
+
+
 def test_postgres_podman_seed_counts() -> None:
     info = _podman("info")
     if info.returncode != 0:
