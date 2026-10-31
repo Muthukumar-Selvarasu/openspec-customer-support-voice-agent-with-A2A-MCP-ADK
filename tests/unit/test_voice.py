@@ -110,6 +110,16 @@ def test_settle_window_defaults_to_1500_ms() -> None:
     assert _SETTLE_MS == 1500
 
 
+def test_settle_ms_quick_is_400_and_explain_is_1500() -> None:
+    from src.voice.router import settle_ms
+
+    assert settle_ms("quick") == 400
+    assert settle_ms(" QUICK ") == 400
+    assert settle_ms("explain") == 1500
+    assert settle_ms(None) == 1500
+    assert settle_ms("nope") == 1500
+
+
 def _app(pipeline, monkeypatch):
     from fastapi import FastAPI
 
@@ -235,6 +245,107 @@ def test_interrupt_emits_turn_end_interrupted(monkeypatch) -> None:
     assert interrupted == {"type": "turn_end", "reason": "interrupted"}
 
 
+def test_interrupt_keeps_the_assistant_reply_in_the_transcript() -> None:
+    import subprocess
+    from pathlib import Path
+
+    source = (Path(__file__).resolve().parents[2] / "src" / "voice" / "ui.js").read_text(
+        encoding="utf-8"
+    )
+    start = source.index("function bubbleHasAnswer(")
+    end = source.index("function onMessage(", start)
+    script = "\n".join(
+        [
+            "let node = null;",
+            "let userBubble = { id: 'user' };",
+            source[start:end],
+            "function makeBubble(text, typing) {",
+            "  return {",
+            "    textContent: text,",
+            "    innerHTML: text,",
+            "    querySelector(sel) { return sel === '.typing' && typing ? { typing: true } : null; },",
+            "  };",
+            "}",
+            "function makeNode(bubble) {",
+            "  const removed = [];",
+            "  return {",
+            "    bubble,",
+            "    removed,",
+            "    querySelector(sel) {",
+            "      if (sel === '.bubble') return bubble;",
+            "      if (sel === '.pill') return { textContent: '1' };",
+            "      return null;",
+            "    },",
+            "    querySelectorAll() { return [{ remove() { removed.push(1); } }]; },",
+            "  };",
+            "}",
+            "const answered = makeBubble('Your order has shipped.', false);",
+            "const answeredNode = makeNode(answered);",
+            "node = answeredNode;",
+            "onTurnEnd({ reason: 'interrupted' });",
+            "const kept = { nodeCleared: node === null, text: answered.innerHTML, removed: answeredNode.removed.length };",
+            "const waiting = makeBubble('Listening…', true);",
+            "const waitingNode = makeNode(waiting);",
+            "node = waitingNode;",
+            "userBubble = { id: 'user' };",
+            "onTurnEnd({ reason: 'interrupted' });",
+            "const reset = { sameNode: node === waitingNode, html: waiting.innerHTML, removed: waitingNode.removed.length };",
+            "console.log(JSON.stringify({ kept, reset }));",
+        ]
+    )
+    proc = subprocess.run(["node", "-"], input=script, text=True, capture_output=True, check=False)
+    assert proc.returncode == 0, proc.stderr
+    import json
+
+    result = json.loads(proc.stdout)
+    assert result["kept"]["nodeCleared"] is True
+    assert result["kept"]["text"] == "Your order has shipped."
+    assert result["kept"]["removed"] == 0
+    assert result["reset"]["sameNode"] is True
+    assert "Listening…" in result["reset"]["html"]
+    assert result["reset"]["removed"] == 1
+
+
+def test_mic_off_removes_a_listening_placeholder() -> None:
+    import json
+    import subprocess
+    from pathlib import Path
+
+    source = (Path(__file__).resolve().parents[2] / "src" / "voice" / "ui.js").read_text(
+        encoding="utf-8"
+    )
+    start = source.index("function bubbleHasAnswer(")
+    end = source.index("function onTurnEnd(", start)
+    script = "\n".join(
+        [
+            "let node = null;",
+            "let userBubble = { id: 'user' };",
+            source[start:end],
+            "const removed = [];",
+            "const bubble = {",
+            "  textContent: 'Listening…',",
+            "  querySelector(sel) { return sel === '.typing' ? {} : null; },",
+            "};",
+            "node = { querySelector(sel) { return sel === '.bubble' ? bubble : null; }, remove() { removed.push(1); } };",
+            "dropUnansweredTurn();",
+            "const cleared = { removed: removed.length, node: node, user: userBubble.id };",
+            "const answer = { textContent: 'Your order has shipped.', querySelector() { return null; } };",
+            "let answerNode = { querySelector(sel) { return sel === '.bubble' ? answer : null; }, remove() { removed.push('answer'); } };",
+            "node = answerNode;",
+            "dropUnansweredTurn();",
+            "console.log(JSON.stringify({ cleared, kept: node === null, answerRemoved: removed.includes('answer') }));",
+        ]
+    )
+    proc = subprocess.run(["node", "-"], input=script, text=True, capture_output=True, check=False)
+    assert proc.returncode == 0, proc.stderr
+    result = json.loads(proc.stdout)
+    assert result["cleared"]["removed"] == 1
+    assert result["cleared"]["node"] is None
+    assert result["cleared"]["user"] == "user"
+    assert result["kept"] is True
+    assert result["answerRemoved"] is False
+
+
 def FastAPI_app(pipeline):
     from fastapi import FastAPI
 
@@ -253,6 +364,294 @@ def test_router_does_not_import_the_shopper_app() -> None:
     )
     assert "src.api" not in source
     assert "GOOGLE_CLOUD_PROJECT" not in source
+
+
+def _patch_voice(monkeypatch, pipeline, *, mask: str = "true", stream: str = "true"):
+    from fastapi import FastAPI
+
+    from src.voice import router
+
+    monkeypatch.setenv("MASK", mask)
+    monkeypatch.setenv("AGENT_RESPONSE_STREAM", stream)
+    router.refresh_flags()
+
+    async def transcribe(pcm: bytes, sample_rate: int = 16000):
+        return "where is my order", SimpleNamespace(prompt_token_count=4, candidates_token_count=2)
+
+    monkeypatch.setattr(router, "transcribe", transcribe)
+    app = FastAPI()
+    app.include_router(router.make_voice_router(runners={"shopper": object()}, pipeline=pipeline))
+    return router, app
+
+
+def test_demo_mode_quick_skips_judge_and_speaks_first_sentence(monkeypatch) -> None:
+    import asyncio
+    import json
+    import threading
+
+    from fastapi.testclient import TestClient
+
+    spoken: list[str] = []
+    flags: list[dict] = []
+    settled: list[str] = []
+    gate = threading.Event()
+    first = "First sentence is ready now. "
+    full = first + "Second sentence follows after this."
+
+    async def synthesize_stream(text: str, usage_out: dict | None = None):
+        spoken.append(text)
+        yield b"\x00\x01" * 200
+
+    async def pipeline(runner, user_id, text, **kwargs):
+        flags.append(dict(kwargs))
+        yield {
+            "type": "step",
+            "key": "sanitize",
+            "title": "Sanitizer",
+            "status": "passed",
+            "detail": "ok",
+            "span": "security.sanitize",
+            "ms": 1,
+        }
+        yield {"type": "delta", "text": first}
+        await asyncio.to_thread(gate.wait, 5)
+        yield {"type": "delta", "text": full}
+        yield {"type": "final", "blocked": False, "response": full}
+
+    router, app = _patch_voice(monkeypatch, pipeline)
+
+    def fast_settle(mode):
+        settled.append(mode)
+        return 20
+
+    monkeypatch.setattr(router, "settle_ms", fast_settle)
+    monkeypatch.setattr(router, "synthesize_stream", synthesize_stream)
+    assert router.STREAM_ENABLED is False
+    assert router.STREAM_ENABLED == (router.AGENT_RESPONSE_STREAM and not router.MASK_ENABLED)
+
+    with TestClient(app) as client:
+        with client.websocket_connect("/voice/ws?user_id=shopper") as ws:
+            ws.send_text(json.dumps({"type": "mode", "mode": "quick"}))
+            ws.send_bytes(b"\x00\x01" * 160)
+            saw_audio = False
+            keys: list[str] = []
+            for _ in range(40):
+                message = ws.receive()
+                if message.get("bytes") is not None:
+                    saw_audio = True
+                    break
+                if message.get("text"):
+                    event = json.loads(message["text"])
+                    if event.get("key"):
+                        keys.append(event["key"])
+            assert saw_audio
+            assert spoken
+            assert spoken[0].startswith("First sentence")
+            assert "Second" not in "".join(spoken)
+            assert "sanitize" in keys
+            assert "judge" not in keys
+            assert "mask" not in keys
+            gate.set()
+            _events(ws)
+
+    assert settled == ["quick"]
+    assert flags[0]["judge"] is False
+    assert flags[0]["mask"] is False
+    assert flags[0]["stream"] is True
+
+
+def test_demo_mode_explain_keeps_judge_masker_and_buffered_speech(monkeypatch) -> None:
+    import json
+
+    from fastapi.testclient import TestClient
+
+    spoken: list[str] = []
+    flags: list[dict] = []
+    settled: list[str] = []
+    reply = "Full answer stays buffered. Second sentence too."
+
+    async def synthesize_stream(text: str, usage_out: dict | None = None):
+        spoken.append(text)
+        yield b"\x00\x01" * 80
+
+    async def pipeline(runner, user_id, text, **kwargs):
+        flags.append(dict(kwargs))
+        yield {
+            "type": "step",
+            "key": "sanitize",
+            "title": "Sanitizer",
+            "status": "passed",
+            "detail": "ok",
+            "span": "security.sanitize",
+            "ms": 1,
+        }
+        yield {
+            "type": "step",
+            "key": "judge",
+            "title": "Security Judge",
+            "status": "passed",
+            "detail": "ok",
+            "span": "security.a2a_judge",
+            "ms": 1,
+        }
+        yield {
+            "type": "step",
+            "key": "mask",
+            "title": "Data Masker",
+            "status": "passed",
+            "detail": "ok",
+            "span": "security.a2a_mask",
+            "ms": 1,
+        }
+        yield {"type": "final", "blocked": False, "response": reply}
+
+    router, app = _patch_voice(monkeypatch, pipeline)
+
+    def fast_settle(mode):
+        settled.append(mode)
+        return 20
+
+    monkeypatch.setattr(router, "settle_ms", fast_settle)
+    monkeypatch.setattr(router, "synthesize_stream", synthesize_stream)
+
+    with TestClient(app) as client:
+        with client.websocket_connect("/voice/ws?user_id=shopper") as ws:
+            ws.send_bytes(b"\x00\x01" * 160)
+            events = _events(ws)
+
+    assert settled == ["explain"]
+    assert flags[0]["judge"] is True
+    assert flags[0]["mask"] is True
+    assert flags[0]["stream"] is False
+    assert flags[0]["stream"] == router.STREAM_ENABLED
+    assert spoken == [reply]
+    assert any(event.get("key") == "judge" for event in events)
+    assert any(event.get("key") == "mask" for event in events)
+    assert any(event.get("type") == "_audio" for event in events)
+
+
+def test_demo_mode_inflight_turn_keeps_the_mode_it_started_with(monkeypatch) -> None:
+    import asyncio
+    import json
+    import threading
+
+    from fastapi.testclient import TestClient
+
+    flags: list[dict] = []
+    started = threading.Event()
+    release = threading.Event()
+
+    async def synthesize_stream(text: str, usage_out: dict | None = None):
+        yield b"\x00\x01" * 40
+
+    async def pipeline(runner, user_id, text, **kwargs):
+        flags.append(dict(kwargs))
+        if len(flags) == 1:
+            started.set()
+            await asyncio.to_thread(release.wait, 5)
+        yield {"type": "final", "blocked": False, "response": "done"}
+
+    router, app = _patch_voice(monkeypatch, pipeline)
+    monkeypatch.setattr(router, "settle_ms", lambda mode: 20)
+    monkeypatch.setattr(router, "synthesize_stream", synthesize_stream)
+
+    with TestClient(app) as client:
+        with client.websocket_connect("/voice/ws?user_id=shopper") as ws:
+            ws.send_bytes(b"\x00\x01" * 160)
+            assert started.wait(3)
+            ws.send_text(json.dumps({"type": "mode", "mode": "quick"}))
+            release.set()
+            assert _events(ws)[-1]["type"] == "turn_end"
+            ws.send_bytes(b"\x00\x01" * 160)
+            assert _events(ws)[-1]["type"] == "turn_end"
+
+    assert flags[0]["judge"] is True
+    assert flags[0]["mask"] is True
+    assert flags[0]["stream"] is False
+    assert flags[1]["judge"] is False
+    assert flags[1]["mask"] is False
+    assert flags[1]["stream"] is True
+
+
+def test_barge_in_only_while_the_agent_is_speaking() -> None:
+    import json
+    import subprocess
+    from pathlib import Path
+
+    source = (Path(__file__).resolve().parents[2] / "src" / "voice" / "ui.js").read_text(
+        encoding="utf-8"
+    )
+    start = source.index("function bargeIn(")
+    end = source.index("function downsample(", start)
+    script = "\n".join(
+        [
+            "let agentSpeaking = false;",
+            "let stopped = 0;",
+            "let interrupted = 0;",
+            "function stopPlayback() { stopped += 1; }",
+            "function sendInterrupt() { interrupted += 1; }",
+            source[start:end],
+            "bargeIn();",
+            "const quiet = { stopped, interrupted };",
+            "agentSpeaking = true;",
+            "bargeIn();",
+            "console.log(JSON.stringify({ quiet, speaking: { stopped, interrupted } }));",
+        ]
+    )
+    proc = subprocess.run(["node", "-"], input=script, text=True, capture_output=True, check=False)
+    assert proc.returncode == 0, proc.stderr
+    result = json.loads(proc.stdout)
+    assert result["quiet"] == {"stopped": 0, "interrupted": 0}
+    assert result["speaking"] == {"stopped": 1, "interrupted": 1}
+
+
+def test_more_speech_does_not_cancel_the_answer_in_progress(monkeypatch) -> None:
+    import asyncio
+    import threading
+    from types import SimpleNamespace
+
+    from fastapi.testclient import TestClient
+
+    from src.voice import router
+
+    started = threading.Event()
+    heard_more = threading.Event()
+    release = threading.Event()
+    calls = {"n": 0}
+    queries: list[str] = []
+
+    async def transcribe(pcm: bytes, sample_rate: int = 16000):
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            heard_more.set()
+        text = "hi hello" if calls["n"] == 1 else "how are you"
+        return text, SimpleNamespace(prompt_token_count=4, candidates_token_count=2)
+
+    async def pipeline(runner, user_id, text, **kwargs):
+        queries.append(text)
+        started.set()
+        await asyncio.to_thread(release.wait, 5)
+        yield {
+            "type": "final",
+            "blocked": True,
+            "response": "blocked",
+            "stage": "judge",
+        }
+
+    monkeypatch.setattr(router, "transcribe", transcribe)
+    monkeypatch.setattr(router, "settle_ms", lambda mode: 20)
+    app = FastAPI_app(pipeline)
+    with TestClient(app) as client:
+        with client.websocket_connect("/voice/ws?user_id=shopper") as ws:
+            ws.send_bytes(b"\x00\x01" * 160)
+            assert started.wait(3)
+            ws.send_bytes(b"\x00\x01" * 160)
+            assert heard_more.wait(3)
+            release.set()
+            events = _events(ws)
+
+    assert queries == ["hi hello"]
+    assert events[-1] == {"type": "turn_end"}
 
 
 @pytest.mark.skipif(not os.getenv("GOOGLE_API_KEY"), reason="GOOGLE_API_KEY is not set")
