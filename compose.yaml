@@ -17,5 +17,141 @@ services:
       retries: 30
       start_period: 5s
 
+  mcp-toolbox:
+    image: docker.io/library/node:22-bookworm-slim
+    platform: linux/amd64
+    command:
+      - npx
+      - -y
+      - "@toolbox-sdk/server@1.5.0"
+      - --config
+      - /config/tools.yaml
+      - --enable-api
+      - --address
+      - 0.0.0.0
+      - --port
+      - "5000"
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./.run/tools.yaml:/config/tools.yaml:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:5000/').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 36
+      start_period: 40s
+
+  a2a:
+    image: cs-voice-app
+    build: .
+    command: ["python", "-m", "src.a2a.run_servers"]
+    environment:
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+      A2A_JUDGE_HOST: 0.0.0.0
+      A2A_JUDGE_PORT: "10002"
+      A2A_MASK_HOST: 0.0.0.0
+      A2A_MASK_PORT: "10003"
+    ports:
+      - "10002:10002"
+      - "10003:10003"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:10002/.well-known/agent.json', timeout=3)",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 36
+      start_period: 25s
+
+  web:
+    image: cs-voice-app
+    build: .
+    command: ["python", "-m", "src.api.web"]
+    environment:
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+      MEM0_API_KEY: ${MEM0_API_KEY:-}
+      MASK: ${MASK:-true}
+      AGENT_RESPONSE_STREAM: ${AGENT_RESPONSE_STREAM:-false}
+      TELEMETRY: ${TELEMETRY:-true}
+      DATABASE_URL: postgresql://toolbox_user:mysecretpassword@postgres:5432/toolbox_db
+      TOOLBOX_URL: http://mcp-toolbox:5000
+      A2A_JUDGE_HOST: a2a
+      A2A_JUDGE_PORT: "10002"
+      A2A_MASK_HOST: a2a
+      A2A_MASK_PORT: "10003"
+      PHOENIX_URL: http://phoenix:6006
+      PHOENIX_PUBLIC_URL: http://127.0.0.1:6006
+      HOST: 0.0.0.0
+      PORT: "8000"
+      WEB_PORT: "8000"
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mcp-toolbox:
+        condition: service_healthy
+      a2a:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/', timeout=3)",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 36
+      start_period: 25s
+
+  cli:
+    image: cs-voice-app
+    build: .
+    profiles: ["cli"]
+    command: ["python", "-m", "src.api.cli"]
+    stdin_open: true
+    tty: true
+    environment:
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+      MEM0_API_KEY: ${MEM0_API_KEY:-}
+      MASK: ${MASK:-true}
+      AGENT_RESPONSE_STREAM: ${AGENT_RESPONSE_STREAM:-false}
+      TELEMETRY: ${TELEMETRY:-true}
+      DATABASE_URL: postgresql://toolbox_user:mysecretpassword@postgres:5432/toolbox_db
+      TOOLBOX_URL: http://mcp-toolbox:5000
+      A2A_JUDGE_HOST: a2a
+      A2A_JUDGE_PORT: "10002"
+      A2A_MASK_HOST: a2a
+      A2A_MASK_PORT: "10003"
+      PHOENIX_URL: http://phoenix:6006
+      PHOENIX_PUBLIC_URL: http://127.0.0.1:6006
+      HOST: 0.0.0.0
+      PORT: "8000"
+      WEB_PORT: "8000"
+
+  phoenix:
+    image: docker.io/arizephoenix/phoenix:latest
+    environment:
+      PHOENIX_WORKING_DIR: /mnt/data
+      PHOENIX_PORT: "6006"
+    ports:
+      - "6006:6006"
+
 volumes:
   cs_postgres_data:

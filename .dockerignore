@@ -1,0 +1,12 @@
+.git
+.venv
+.env
+.env.*
+!.env.example
+.run
+__pycache__
+.pytest_cache
+openspec
+docs
+backup
+*.pyc
