@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import time
@@ -227,6 +228,54 @@ def _enforce_tenant_tool_callback(tool, args, tool_context):
 session_service = InMemorySessionService()
 _runners: dict[str, Runner] = {}
 _transcripts: dict[str, list] = {}
+PAGE_LEAVE_GRACE_MS = 3000
+_active_epoch: dict[str, str] = {}
+_leave_tasks: dict[str, asyncio.Task] = {}
+
+
+def _cancel_scheduled_flush(user_id: str) -> None:
+    task = _leave_tasks.pop(user_id, None)
+    if task is not None and not task.done():
+        task.cancel()
+
+
+def _seal_epoch(user_id: str) -> None:
+    """Drop a pending leave and ignore an older epoch until a new one is adopted."""
+    _cancel_scheduled_flush(user_id)
+    _active_epoch[user_id] = f"sealed-{time.time_ns()}"
+
+
+async def _flush_shopper(user_id: str) -> None:
+    _runners.pop(user_id, None)
+    messages = _transcripts.pop(user_id, None)
+    if messages:
+        try:
+            save_memory(messages, user_id)
+        except Exception:
+            pass
+    try:
+        await session_service.delete_session(
+            app_name=APP_NAME,
+            user_id=user_id,
+            session_id=f"session_{user_id}",
+        )
+    except Exception:
+        pass
+
+
+async def _flush_after_leave(user_id: str, epoch: str) -> None:
+    try:
+        await asyncio.sleep(PAGE_LEAVE_GRACE_MS / 1000)
+    except asyncio.CancelledError:
+        return
+    if _active_epoch.get(user_id) != epoch:
+        if _leave_tasks.get(user_id) is asyncio.current_task():
+            _leave_tasks.pop(user_id, None)
+        return
+    _active_epoch.pop(user_id, None)
+    if _leave_tasks.get(user_id) is asyncio.current_task():
+        _leave_tasks.pop(user_id, None)
+    await _flush_shopper(user_id)
 
 
 def _build_runner(user_id: str) -> Runner:
@@ -538,6 +587,7 @@ class ChatReq(BaseModel):
 
 class LogoutReq(BaseModel):
     user_id: str
+    epoch: str | None = None
 
 
 def _turn_span(user_id: str, message: str, channel: str):
@@ -557,6 +607,7 @@ async def login(req: LoginReq):
     if not ctx:
         return JSONResponse({"ok": False, "error": "Invalid email or password."}, status_code=401)
     uid = ctx["email"]
+    _seal_epoch(uid)
     _runners[uid] = _build_runner(uid)
     _transcripts[uid] = []
     session_id = f"session_{uid}"
@@ -578,23 +629,36 @@ async def login(req: LoginReq):
     }
 
 
+@app.post("/api/session")
+async def session(req: LogoutReq):
+    """True when this browser reload still has the in-memory shopper runner."""
+    _cancel_scheduled_flush(req.user_id)
+    if req.epoch:
+        _active_epoch[req.user_id] = req.epoch
+    if req.user_id not in _runners:
+        return JSONResponse({"ok": False, "error": "Not logged in."}, status_code=401)
+    return {"ok": True, "user_id": req.user_id}
+
+
+@app.post("/api/page-leave")
+async def page_leave(req: LogoutReq):
+    """Schedule the logout flush. A newer epoch can still cancel it."""
+    epoch = req.epoch or ""
+    if not epoch:
+        return {"ok": True}
+    current = _active_epoch.get(req.user_id)
+    if current is not None and current != epoch:
+        return {"ok": True}
+    _active_epoch[req.user_id] = epoch
+    _cancel_scheduled_flush(req.user_id)
+    _leave_tasks[req.user_id] = asyncio.create_task(_flush_after_leave(req.user_id, epoch))
+    return {"ok": True}
+
+
 @app.post("/api/logout")
 async def logout(req: LogoutReq):
-    _runners.pop(req.user_id, None)
-    messages = _transcripts.pop(req.user_id, None)
-    if messages:
-        try:
-            save_memory(messages, req.user_id)
-        except Exception:
-            pass
-    try:
-        await session_service.delete_session(
-            app_name=APP_NAME,
-            user_id=req.user_id,
-            session_id=f"session_{req.user_id}",
-        )
-    except Exception:
-        pass
+    _seal_epoch(req.user_id)
+    await _flush_shopper(req.user_id)
     return {"ok": True}
 
 
