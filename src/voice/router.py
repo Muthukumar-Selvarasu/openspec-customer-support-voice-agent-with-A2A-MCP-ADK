@@ -20,6 +20,7 @@ from src.voice.tts import TTS_MODEL, TTS_SAMPLE_RATE, TTS_VOICE, synthesize_stre
 _UI_JS = Path(__file__).resolve().parent / "ui.js"
 _AUDIO_CHUNK = 48000
 _SETTLE_MS = 1500
+_QUICK_SETTLE_MS = 400
 _BYTES_PER_SEC = TTS_SAMPLE_RATE * 2
 _SENT_END = re.compile(r"[.!?…](?:[\"')\]]+)?(?:\s|$)")
 
@@ -31,6 +32,20 @@ def _flag(name: str, default: str) -> bool:
 MASK_ENABLED = _flag("MASK", "true")
 AGENT_RESPONSE_STREAM = _flag("AGENT_RESPONSE_STREAM", "false")
 STREAM_ENABLED = AGENT_RESPONSE_STREAM and not MASK_ENABLED
+
+
+def normalize_demo_mode(mode: str | None) -> str:
+    """Missing or unrecognized values stay on Explain."""
+    if isinstance(mode, str) and mode.strip().lower() == "quick":
+        return "quick"
+    return "explain"
+
+
+def settle_ms(mode: str | None) -> int:
+    """Quiet window before a voice turn. Quick is 400 ms; Explain is 1500 ms."""
+    if normalize_demo_mode(mode) == "quick":
+        return _QUICK_SETTLE_MS
+    return _SETTLE_MS
 
 
 def refresh_flags() -> None:
@@ -98,6 +113,7 @@ def make_voice_router(
             return
 
         pending = ""
+        connection_mode = "explain"
         stt_acc = {"in": 0, "out": 0}
         stt_time = {"sec": 0.0}
         agent_task: asyncio.Task | None = None
@@ -119,8 +135,12 @@ def make_voice_router(
             stt_acc["in"] = stt_acc["out"] = 0
             stt_time["sec"] = 0.0
 
-        async def run_agent(text: str) -> None:
+        async def run_agent(text: str, turn_mode: str) -> None:
             nonlocal pending
+            quick = turn_mode == "quick"
+            turn_stream = True if quick else STREAM_ENABLED
+            turn_mask = False if quick else do_mask
+            turn_judge = not quick
             answer_text = ""
             timing: dict[str, float] = {}
             agent_tok = {"in": 0, "out": 0}
@@ -188,7 +208,7 @@ def make_voice_router(
                 else:
                     detail += ", no audio produced"
                 runs = f"{TTS_MODEL} · voice {TTS_VOICE} · text in, 24 kHz PCM out"
-                if STREAM_ENABLED:
+                if turn_stream:
                     runs += " · sentence by sentence, concurrent with the agent"
                 return {
                     "type": "step",
@@ -241,9 +261,10 @@ def make_voice_router(
                         runner,
                         user_id,
                         text,
-                        stream=STREAM_ENABLED,
+                        stream=turn_stream,
                         turn_span=span,
-                        mask=do_mask,
+                        mask=turn_mask,
+                        judge=turn_judge,
                     ):
                         kind = event["type"]
                         if kind == "stage":
@@ -314,7 +335,7 @@ def make_voice_router(
                         reset_query()
                         return
 
-                    if STREAM_ENABLED and tts_queue is not None:
+                    if turn_stream and tts_queue is not None:
                         if tts_buffer.strip():
                             tts_queue.put_nowait(tts_buffer)
                         tts_queue.put_nowait(None)
@@ -365,7 +386,10 @@ def make_voice_router(
                     while current.uncancel():
                         pass
                 span.set_attribute("turn.interrupted", True)
-                await send_json({"type": "turn_end", "reason": "interrupted"})
+                try:
+                    await send_json({"type": "turn_end", "reason": "interrupted"})
+                except (WebSocketDisconnect, RuntimeError):
+                    return
                 raise
             except Exception as exc:
                 message = str(exc)[:300]
@@ -375,21 +399,24 @@ def make_voice_router(
             finally:
                 turn.__exit__(None, None, None)
 
-        async def settle_then_run() -> None:
+        async def settle_then_run(turn_mode: str) -> None:
             nonlocal agent_task
             try:
-                await asyncio.sleep(_SETTLE_MS / 1000)
+                await asyncio.sleep(settle_ms(turn_mode) / 1000)
             except asyncio.CancelledError:
                 return
             query = pending.strip()
             if query:
-                agent_task = asyncio.create_task(run_agent(query))
+                agent_task = asyncio.create_task(run_agent(query, turn_mode))
 
         def restart_settle() -> None:
             nonlocal settle_task
+            if agent_task and not agent_task.done():
+                return
             if settle_task and not settle_task.done():
                 settle_task.cancel()
-            settle_task = asyncio.create_task(settle_then_run())
+            turn_mode = connection_mode
+            settle_task = asyncio.create_task(settle_then_run(turn_mode))
 
         async def handle_burst(pcm: bytes) -> None:
             nonlocal pending
@@ -439,14 +466,15 @@ def make_voice_router(
                 if message.get("type") == "websocket.disconnect":
                     break
                 if message.get("bytes") is not None:
-                    stop_answer()
                     asyncio.create_task(handle_burst(message["bytes"]))
                 elif message.get("text"):
                     try:
                         data = json.loads(message["text"])
                     except json.JSONDecodeError:
                         continue
-                    if data.get("type") == "interrupt":
+                    if data.get("type") == "mode":
+                        connection_mode = normalize_demo_mode(data.get("mode"))
+                    elif data.get("type") == "interrupt":
                         stop_answer()
         except WebSocketDisconnect:
             pass

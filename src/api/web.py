@@ -110,6 +110,25 @@ def mask_enabled() -> bool:
     return os.getenv("MASK", "true").strip().lower() in ("1", "true", "yes", "on")
 
 
+def resolve_demo_mode(mode: str | None) -> str:
+    """Missing or unrecognized values stay on the full cascade."""
+    if isinstance(mode, str) and mode.strip().lower() == "quick":
+        return "quick"
+    return "explain"
+
+
+def demo_pipeline_kwargs(mode: str | None, *, stream_endpoint: bool) -> dict[str, bool]:
+    """Per-turn flags. Quick skips Judge and Masker. Explain keeps the mask interlock."""
+    if resolve_demo_mode(mode) == "quick":
+        return {"judge": False, "mask": False, "stream": True}
+    do_mask = mask_enabled()
+    return {
+        "judge": True,
+        "mask": do_mask,
+        "stream": (not do_mask) if stream_endpoint else False,
+    }
+
+
 _toolbox_client = None
 _database_tools = None
 
@@ -324,6 +343,7 @@ async def text_pipeline(
     stream: bool = False,
     turn_span=None,
     mask: bool | None = None,
+    judge: bool = True,
 ):
     """Run one turn and yield inspector events for chat and voice."""
     do_mask = mask_enabled() if mask is None else mask
@@ -364,37 +384,38 @@ async def text_pipeline(
         yield blocked("sanitizer", f"Input rejected by sanitizer: {reason}")
         return
 
-    yield {"type": "stage", "key": "judge", "stage": "A2A Security Judge"}
-    t0 = time.perf_counter()
-    with tracer.start_as_current_span("security.a2a_judge") as span:
-        span.set_attribute(ATTR.OPENINFERENCE_SPAN_KIND, "GUARDRAIL")
-        span.set_attribute(ATTR.INPUT_VALUE, clean)
-        try:
-            ok, verdict = await _judge(clean)
-        except Exception as exc:
-            span.set_attribute(ATTR.OUTPUT_VALUE, f"error: {exc}")
-            yield {"type": "error", "error": f"Security Judge unreachable: {exc}"}
+    if judge:
+        yield {"type": "stage", "key": "judge", "stage": "A2A Security Judge"}
+        t0 = time.perf_counter()
+        with tracer.start_as_current_span("security.a2a_judge") as span:
+            span.set_attribute(ATTR.OPENINFERENCE_SPAN_KIND, "GUARDRAIL")
+            span.set_attribute(ATTR.INPUT_VALUE, clean)
+            try:
+                ok, verdict = await _judge(clean)
+            except Exception as exc:
+                span.set_attribute(ATTR.OUTPUT_VALUE, f"error: {exc}")
+                yield {"type": "error", "error": f"Security Judge unreachable: {exc}"}
+                return
+            span.set_attribute(ATTR.OUTPUT_VALUE, "passed" if ok else "blocked")
+        judged = (
+            "cleared: echoed the input back unmodified"
+            if ok
+            else f"returned BLOCKED: {verdict.strip()[:200]}"
+        )
+        yield _step(
+            "judge",
+            "Security Judge",
+            ok,
+            judged,
+            "security.a2a_judge",
+            t0,
+            kind="A2A",
+            runs=f"ADK agent behind an A2A server at :{settings.judge_port}",
+            text_chars=len(clean),
+        )
+        if not ok:
+            yield blocked("judge", "Blocked by the A2A Security Judge (possible injection/unsafe input).")
             return
-        span.set_attribute(ATTR.OUTPUT_VALUE, "passed" if ok else "blocked")
-    judged = (
-        "cleared: echoed the input back unmodified"
-        if ok
-        else f"returned BLOCKED: {verdict.strip()[:200]}"
-    )
-    yield _step(
-        "judge",
-        "Security Judge",
-        ok,
-        judged,
-        "security.a2a_judge",
-        t0,
-        kind="A2A",
-        runs=f"ADK agent behind an A2A server at :{settings.judge_port}",
-        text_chars=len(clean),
-    )
-    if not ok:
-        yield blocked("judge", "Blocked by the A2A Security Judge (possible injection/unsafe input).")
-        return
 
     yield {"type": "stage", "key": "agent", "stage": "Agent thinking"}
     content = types.Content(role="user", parts=[types.Part(text=clean)])
@@ -512,6 +533,7 @@ class LoginReq(BaseModel):
 class ChatReq(BaseModel):
     user_id: str
     message: str
+    mode: str | None = None
 
 
 class LogoutReq(BaseModel):
@@ -584,7 +606,13 @@ async def chat(req: ChatReq):
     turn, span = _turn_span(req.user_id, req.message, "text")
     tool_calls, out = [], None
     try:
-        async for event in text_pipeline(runner, req.user_id, req.message, turn_span=span):
+        async for event in text_pipeline(
+            runner,
+            req.user_id,
+            req.message,
+            turn_span=span,
+            **demo_pipeline_kwargs(req.mode, stream_endpoint=False),
+        ):
             if event["type"] == "tool_call":
                 tool_calls.append({"name": event["name"], "args": event["args"], "result": None})
             elif event["type"] == "tool_result":
@@ -628,14 +656,12 @@ async def chat_stream(req: ChatReq):
             linked = trace_url(span)
             if linked:
                 yield json.dumps({"type": "trace", "span": "agent.turn", **linked}) + "\n"
-            do_mask = mask_enabled()
             async for event in text_pipeline(
                 runner,
                 req.user_id,
                 req.message,
-                stream=not do_mask,
                 turn_span=span,
-                mask=do_mask,
+                **demo_pipeline_kwargs(req.mode, stream_endpoint=True),
             ):
                 yield json.dumps(event, default=str) + "\n"
                 if event["type"] == "final" and not event["blocked"]:

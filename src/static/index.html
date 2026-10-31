@@ -19,6 +19,12 @@
   header h1{font-size:15px;font-weight:600;margin:0;letter-spacing:.2px}
   header h1 small{font-weight:500;color:var(--muted)}
   header .who{margin-left:auto;color:var(--muted);font-size:13px}
+  header .mode{display:flex;border:1px solid var(--line);border-radius:9px;overflow:hidden;flex:none}
+  header .mode-btn{background:transparent;color:var(--muted);border:0;border-radius:0;padding:5px 12px;
+       font-size:13px;font-weight:600;cursor:pointer}
+  header .mode-btn.on{background:var(--accent);color:#fff}
+  header .mode-btn:hover{color:var(--text)}
+  header .mode-btn.on:hover{color:#fff}
   header .logout{margin-left:14px;background:transparent;color:var(--muted);border:1px solid var(--line);
        border-radius:9px;padding:5px 12px;font-size:13px;font-weight:500;cursor:pointer}
   header .logout:hover{color:var(--text);border-color:var(--muted)}
@@ -140,8 +146,12 @@
   <span class="dot"></span>
   <h1>Customer Support Agent <small>· cascade voice agent (STT → pipeline → TTS)</small></h1>
   <span class="who" id="who"></span>
+  <div class="mode" id="demoMode" role="group" aria-label="Demo response mode">
+    <button type="button" id="modeExplain" class="mode-btn on" aria-pressed="true">Explain</button>
+    <button type="button" id="modeQuick" class="mode-btn" aria-pressed="false">Quick</button>
+  </div>
   <a id="archLink" class="logout" href="/architecture" target="arch">Architecture ↗</a>
-  <button id="logout" class="logout" style="display:none">Sign out</button>
+  <button type="button" id="logout" class="logout" style="display:none">Sign out</button>
 </header>
 
 <main>
@@ -151,7 +161,7 @@
       <p>Use a seeded demo account. Password is the first name, lowercase.</p>
       <input id="email" placeholder="email" value="alice.jones@example.com" autocomplete="off"/>
       <input id="password" placeholder="password" type="password" value="alice"/>
-      <button id="loginBtn">Sign in</button>
+      <button type="button" id="loginBtn">Sign in</button>
       <div class="err" id="loginErr"></div>
       <div class="seed">Try: <code>alice.jones@example.com</code> / <code>alice</code> ·
         <code>bob.smith@techmail.com</code> / <code>bob</code> ·
@@ -163,7 +173,7 @@
 <footer id="footer" style="display:none">
   <div class="inwrap">
     <textarea id="input" rows="1" placeholder="Ask about your orders… or tap the mic"></textarea>
-    <button id="send">Send</button>
+    <button type="button" id="send">Send</button>
   </div>
   <div class="status" id="voiceStatus"></div>
   <div class="hint">Voice: speech → STT → [ sanitize → A2A Security Judge → agent + MCP tools + Mem0 → A2A Data Masker ] → TTS → speech. Typed turns run the same bracketed pipeline.</div>
@@ -193,6 +203,28 @@ function md(src){
   return html;
 }
 let USER=null;
+function demoMode(){
+  const saved=localStorage["cs-demo-mode"];
+  return saved==="quick"?"quick":"explain";
+}
+function applyDemoMode(mode){
+  const quick=mode==="quick";
+  const explainBtn=document.getElementById("modeExplain");
+  const quickBtn=document.getElementById("modeQuick");
+  explainBtn.classList.toggle("on", !quick);
+  quickBtn.classList.toggle("on", quick);
+  explainBtn.setAttribute("aria-pressed", String(!quick));
+  quickBtn.setAttribute("aria-pressed", String(quick));
+}
+function setDemoMode(mode){
+  const next=mode==="quick"?"quick":"explain";
+  localStorage["cs-demo-mode"]=next;
+  applyDemoMode(next);
+  if(window.csSendDemoMode) window.csSendDemoMode();
+}
+applyDemoMode(demoMode());
+document.getElementById("modeExplain").onclick=()=>setDemoMode("explain");
+document.getElementById("modeQuick").onclick=()=>setDemoMode("quick");
 const col=document.getElementById('col');
 const footer=document.getElementById('footer');
 const who=document.getElementById('who');
@@ -340,6 +372,7 @@ const archEvent=e=>archBus.postMessage(e);
 // fetch for typed turns, or the voice WebSocket). Event types match Module 4's web UI.
 function renderEvent(node,e){
   archEvent(e);
+  if(demoMode()==="quick" && e.type!=="delta" && e.type!=="final" && e.type!=="error") return;
   const bubble=node.querySelector('.bubble');
   if(e.type==='stage'){ setStatus(node,e.stage); stageStart(node,e); }
   else if(e.type==='trace') setTrace(node,e);
@@ -376,7 +409,7 @@ const SAMPLES=["Where is my last order?", "Show me all my orders", "Cancel my pr
 function renderChips(){
   const wrap=el(`<div class="chips" id="chips"><div class="label">Try asking</div></div>`);
   SAMPLES.forEach(q=>{
-    const c=el(`<button class="chip"></button>`); c.textContent=q;
+    const c=el(`<button type="button" class="chip"></button>`); c.textContent=q;
     c.onclick=()=>{ const i=document.getElementById('input'); i.value=q; send(); };
     wrap.appendChild(c);
   });
@@ -389,10 +422,10 @@ async function fetchChat(text){
   addUser(text);
   const node=addAssistant();
   const bubble=node.querySelector('.bubble');
-  setStatus(node,'Sending');
+  if(demoMode()!=="quick") setStatus(node,'Sending');
   try{
     const r=await fetch('/api/chat/stream',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({user_id:USER,message:text})});
+      body:JSON.stringify({user_id:USER,message:text,mode:demoMode()})});
     if(!r.ok){const d=await r.json().catch(()=>({}));bubble.textContent=d.error||'Error';}
     else{
       const reader=r.body.getReader(), dec=new TextDecoder(); let buf='';

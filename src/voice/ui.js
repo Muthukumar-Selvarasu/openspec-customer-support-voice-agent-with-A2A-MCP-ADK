@@ -45,6 +45,7 @@
 
   const micSvg = '<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" style="vertical-align:middle" aria-hidden="true"><path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3zm5-3c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/></svg>';
   const holdBtn = document.createElement("button");
+  holdBtn.type = "button";
   holdBtn.id = "hold";
   holdBtn.className = "vbtn";
   holdBtn.textContent = "Hold";
@@ -53,6 +54,7 @@
   inwrap.insertBefore(holdBtn, document.getElementById("send"));
 
   const micBtn = document.createElement("button");
+  micBtn.type = "button";
   micBtn.id = "mic";
   micBtn.className = "vbtn";
   micBtn.innerHTML = micSvg;
@@ -60,6 +62,13 @@
   inwrap.insertBefore(micBtn, document.getElementById("send"));
 
   const status = document.getElementById("voiceStatus");
+
+  function sendDemoMode() {
+    if (ws && ws.readyState === 1 && typeof demoMode === "function") {
+      ws.send(JSON.stringify({ type: "mode", mode: demoMode() }));
+    }
+  }
+  window.csSendDemoMode = sendDemoMode;
 
   function setVoiceStatus(text) {
     status.textContent = text ? "🎙 " + text : "";
@@ -123,6 +132,27 @@
     if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: "interrupt" }));
   }
 
+  function bargeIn() {
+    if (!agentSpeaking) return;
+    stopPlayback();
+    sendInterrupt();
+  }
+
+  function downsample(f32, fromRate, toRate) {
+    if (!fromRate || fromRate === toRate) return f32;
+    const ratio = fromRate / toRate;
+    const length = Math.floor(f32.length / ratio);
+    const out = new Float32Array(length);
+    for (let i = 0; i < length; i++) {
+      const index = i * ratio;
+      const left = Math.floor(index);
+      const frac = index - left;
+      const right = Math.min(left + 1, f32.length - 1);
+      out[i] = f32[left] * (1 - frac) + f32[right] * frac;
+    }
+    return out;
+  }
+
   function shipUtterance() {
     speaking = false;
     const total = frames.reduce((count, frame) => count + frame.length, 0);
@@ -143,9 +173,12 @@
   }
 
   function onFrame(f32) {
-    if (muted) return;
-    const rms = rmsOf(f32);
-    const i16 = floatToPcm(f32);
+    if (muted || !captureCtx) return;
+    const frameMs = (f32.length / captureCtx.sampleRate) * 1000;
+    const speech = downsample(f32, captureCtx.sampleRate, CAPTURE_RATE);
+    if (!speech.length) return;
+    const rms = rmsOf(speech);
+    const i16 = floatToPcm(speech);
 
     if (!speaking) {
       preroll.push(i16);
@@ -155,8 +188,7 @@
       const needed = agentSpeaking ? BARGE_FRAMES : ONSET_FRAMES;
       onsetCount = rms > threshold ? onsetCount + 1 : 0;
       if (onsetCount < needed) return;
-      if (agentSpeaking) stopPlayback();
-      sendInterrupt();
+      bargeIn();
       speaking = true;
       frames = preroll.slice();
       preroll = [];
@@ -172,7 +204,7 @@
       return;
     }
     silentFrames += 1;
-    const silenceMs = silentFrames * (FRAME / CAPTURE_RATE) * 1000;
+    const silenceMs = silentFrames * frameMs;
     if (silenceMs >= END_SILENCE_MS) shipUtterance();
   }
 
@@ -181,14 +213,18 @@
       audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
     });
     const AudioCtx = window.AudioContext || window.webkitAudioContext;
-    captureCtx = new AudioCtx({ sampleRate: CAPTURE_RATE });
+    captureCtx = new AudioCtx();
+    if (captureCtx.state === "suspended") await captureCtx.resume();
     const source = captureCtx.createMediaStreamSource(stream);
     proc = captureCtx.createScriptProcessor(FRAME, 1, 1);
     proc.onaudioprocess = (event) => {
       if (voiceOn) onFrame(event.inputBuffer.getChannelData(0));
     };
     source.connect(proc);
-    proc.connect(captureCtx.destination);
+    const sink = captureCtx.createGain();
+    sink.gain.value = 0;
+    proc.connect(sink);
+    sink.connect(captureCtx.destination);
   }
 
   function stopCapture() {
@@ -228,13 +264,36 @@
     return node;
   }
 
+  function bubbleHasAnswer(bubble) {
+    return !!(bubble && !bubble.querySelector(".typing") && bubble.textContent.trim());
+  }
+
+  function dropUnansweredTurn() {
+    if (!node) return;
+    const bubble = node.querySelector(".bubble");
+    if (bubbleHasAnswer(bubble)) {
+      userBubble = null;
+      node = null;
+      return;
+    }
+    node.remove();
+    node = null;
+  }
+
   function onTurnEnd(data) {
     if (data.reason === "interrupted") {
       if (!node) return;
+      const bubble = node.querySelector(".bubble");
+      // Keep a reply that already arrived. The next utterance gets its own bubble.
+      if (bubbleHasAnswer(bubble)) {
+        userBubble = null;
+        node = null;
+        return;
+      }
       node.querySelectorAll('.step:not([data-key="stt"])').forEach((step) => step.remove());
       const pill = node.querySelector(".pill");
       if (pill) pill.textContent = node.querySelectorAll(".step").length;
-      node.querySelector(".bubble").innerHTML = '<span class="typing"><span class="spin"></span>Listening…</span>';
+      if (bubble) bubble.innerHTML = '<span class="typing"><span class="spin"></span>Listening…</span>';
       return;
     }
     userBubble = null;
@@ -260,7 +319,9 @@
         break;
       case "processing":
         ensureNode();
-        setStatus(node, "Running the pipeline");
+        if (typeof demoMode !== "function" || demoMode() !== "quick") {
+          setStatus(node, "Running the pipeline");
+        }
         setVoiceStatus("thinking…");
         break;
       case "response_text":
@@ -280,6 +341,11 @@
       case "cost":
         break;
       case "error":
+        if (/not logged in/i.test(data.message || data.error || "")) {
+          if (typeof forgetShopper === "function") forgetShopper();
+          location.reload();
+          return;
+        }
         ensureNode().querySelector(".bubble").textContent = "Voice error: " + (data.message || data.error);
         scroll();
         break;
@@ -298,6 +364,7 @@
       alert("Sign in first, then use voice.");
       return;
     }
+    window.csVoiceOn = true;
     const AudioCtx = window.AudioContext || window.webkitAudioContext;
     playCtx = new AudioCtx();
     if (playCtx.state === "suspended") await playCtx.resume();
@@ -310,6 +377,7 @@
       ws.onopen = resolve;
       ws.onerror = reject;
     });
+    sendDemoMode();
     await startCapture();
     voiceOn = true;
     muted = false;
@@ -321,6 +389,7 @@
 
   function stopVoice() {
     voiceOn = false;
+    window.csVoiceOn = false;
     muted = false;
     stopCapture();
     stopPlayback();
@@ -335,6 +404,7 @@
     holdBtn.style.display = "none";
     holdBtn.textContent = "Hold";
     holdBtn.classList.remove("on");
+    dropUnansweredTurn();
     setVoiceStatus("");
   }
 
@@ -363,7 +433,7 @@
     }
     startVoice().catch((err) => {
       stopVoice();
-      alert("Could not start voice: " + err);
+      alert("Could not start voice: " + (err && err.message ? err.message : err));
     });
   };
   holdBtn.onclick = toggleHold;
