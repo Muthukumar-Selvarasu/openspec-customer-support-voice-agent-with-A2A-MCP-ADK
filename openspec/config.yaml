@@ -8,8 +8,12 @@ context: |
   Repo layout:
   - docs/ FDE stages 0-3 (ENGAGEMENT.md, 01-discovery/, 02-problem-metrics/, 03-poc/)
   - openspec/ spec-driven engine
-  - src/ application
+  - src/ application package (src.core, src.security, src.a2a, src.agents, src.voice, src.api)
   - tests/ verification
+  Apply one OpenSpec change at a time. Tasks describe what to build under src/.
+  Always land code in src/ with src.* imports, apply that change's spec/design fixes, and skip a task when the user says skip or the requirement is already satisfied.
+  Local containers use Podman (`podman compose`, `podman build`). Do not write docker CLI commands.
+  Local Postgres is a Podman service. Railway uses Neon Postgres (`DATABASE_URL` secret), not a Railway Postgres plugin.
 
 # Per-artifact rules (optional)
 # Add custom rules for specific artifacts.
