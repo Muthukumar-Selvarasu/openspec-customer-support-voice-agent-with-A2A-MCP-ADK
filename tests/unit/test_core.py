@@ -273,6 +273,9 @@ def test_telemetry_skips_browser_open_when_disabled(
     )
 
     tracer = telemetry_mod.get_tracer()
-    assert tracer is fake_trace.get_tracer.return_value
-    fake_px.launch_app.assert_called_once()
-    assert opened == []
+    try:
+        assert tracer is fake_trace.get_tracer.return_value
+        fake_px.launch_app.assert_called_once()
+        assert opened == []
+    finally:
+        telemetry_mod.reset_telemetry_state()
