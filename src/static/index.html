@@ -386,6 +386,38 @@ function renderEvent(node,e){
 }
 
 // ---- login / chips / send -----------------------------------------------------
+const SHOPPER_KEY='cs-shopper';
+const EPOCH_KEY='cs-epoch';
+let epoch='';
+
+function shopperRecord(d){
+  return {user_id:d.user_id, full_name:d.full_name||'', is_premium:!!d.is_premium, model:d.model||''};
+}
+function rememberShopper(d){
+  try{ sessionStorage.setItem(SHOPPER_KEY, JSON.stringify(shopperRecord(d))); }catch(e){}
+}
+function forgetShopper(){
+  try{ sessionStorage.removeItem(SHOPPER_KEY); }catch(e){}
+}
+function newEpoch(){
+  epoch=(window.crypto&&crypto.randomUUID)?crypto.randomUUID():String(Date.now())+Math.random();
+  try{ sessionStorage.setItem(EPOCH_KEY, epoch); }catch(e){}
+  return epoch;
+}
+function enterShop(d){
+  USER=d.user_id;
+  who.textContent=`${d.full_name||''}${d.is_premium?' · premium':''}${d.model?' · '+d.model:''}`;
+  const loginEl=document.getElementById('login');
+  if(loginEl) loginEl.remove();
+  document.getElementById('logout').style.display='inline-block';
+  footer.style.display='block';
+  if(!document.querySelector('.msg')){
+    col.appendChild(el(`<div class="msg assistant"><div class="role">Agent</div><div class="bubble">Hi ${esc(d.full_name)}! Tap the mic to talk, or type below. Ask about your orders — status, history, cancellations, or address changes.</div></div>`));
+    renderChips();
+  }
+  document.getElementById('input').focus();
+  window.dispatchEvent(new CustomEvent('cs:login',{detail:d}));
+}
 async function login(){
   const email=document.getElementById('email').value.trim();
   const password=document.getElementById('password').value;
@@ -394,15 +426,13 @@ async function login(){
     body:JSON.stringify({email,password})});
   const d=await r.json();
   if(!d.ok){err.textContent=d.error||'Login failed';return;}
-  USER=d.user_id;
-  who.textContent=`${d.full_name}${d.is_premium?' · premium':''}${d.model?' · '+d.model:''}`;
-  document.getElementById('login').remove();
-  document.getElementById('logout').style.display='inline-block';
-  footer.style.display='block';
-  col.appendChild(el(`<div class="msg assistant"><div class="role">Agent</div><div class="bubble">Hi ${esc(d.full_name)}! Tap the mic to talk, or type below. Ask about your orders — status, history, cancellations, or address changes.</div></div>`));
-  renderChips();
-  document.getElementById('input').focus();
-  window.dispatchEvent(new CustomEvent('cs:login',{detail:d}));
+  rememberShopper(d);
+  newEpoch();
+  enterShop(d);
+  try{
+    await fetch('/api/session',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({user_id:USER,epoch})});
+  }catch(e){}
 }
 
 const SAMPLES=["Where is my last order?", "Show me all my orders", "Cancel my processing order", "I want to return order 1", "'; DROP TABLE users; --"];
@@ -426,7 +456,11 @@ async function fetchChat(text){
   try{
     const r=await fetch('/api/chat/stream',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({user_id:USER,message:text,mode:demoMode()})});
-    if(!r.ok){const d=await r.json().catch(()=>({}));bubble.textContent=d.error||'Error';}
+    if(!r.ok){
+      const d=await r.json().catch(()=>({}));
+      if(r.status===401){ forgetShopper(); location.reload(); return; }
+      bubble.textContent=d.error||'Error';
+    }
     else{
       const reader=r.body.getReader(), dec=new TextDecoder(); let buf='';
       archEvent({type:'start',message:text});
@@ -455,17 +489,44 @@ async function send(){
 }
 
 async function logout(){
+  forgetShopper();
+  window.csVoiceOn=false;
   window.dispatchEvent(new CustomEvent('cs:logout'));
   try{ if(USER) await fetch('/api/logout',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user_id:USER})}); }
   catch(e){}
   location.reload();
 }
 document.getElementById('logout').onclick=logout;
-// Closing the tab / navigating away is a session end too — flush memory via a beacon
-// (guaranteed to send during page unload) so voice + typed turns get saved like Sign out.
-window.addEventListener('pagehide',()=>{
-  if(USER){ try{ navigator.sendBeacon('/api/logout', new Blob([JSON.stringify({user_id:USER})],{type:'application/json'})); }catch(e){} }
+// A reload and a tab close both fire pagehide. Beacon a cancellable leave, never logout.
+// The next document adopts a new epoch and cancels that leave. A frozen page or an
+// open mic is not a close.
+function shouldFlushOnPageHide(event){
+  if(event&&event.persisted) return false;
+  if(window.csVoiceOn) return false;
+  return !!USER;
+}
+function pageLeaveRequest(event){
+  if(!shouldFlushOnPageHide(event)||!epoch) return null;
+  return {url:'/api/page-leave', body:{user_id:USER, epoch:epoch}};
+}
+window.addEventListener('pagehide',(event)=>{
+  const leave=pageLeaveRequest(event);
+  if(!leave) return;
+  try{ navigator.sendBeacon(leave.url, new Blob([JSON.stringify(leave.body)],{type:'application/json'})); }catch(e){}
 });
+async function restoreShopper(){
+  let saved=null;
+  try{ saved=JSON.parse(sessionStorage.getItem(SHOPPER_KEY)||'null'); }catch(e){}
+  if(!saved||!saved.user_id) return;
+  newEpoch();
+  try{
+    const r=await fetch('/api/session',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({user_id:saved.user_id, epoch})});
+    if(!r.ok){ forgetShopper(); return; }
+  }catch(e){ return; }
+  enterShop(saved);
+}
+restoreShopper();
 document.getElementById('loginBtn').onclick=login;
 document.getElementById('password').addEventListener('keydown',e=>{if(e.key==='Enter')login();});
 document.getElementById('send').onclick=send;

@@ -573,6 +573,37 @@ def test_demo_mode_inflight_turn_keeps_the_mode_it_started_with(monkeypatch) -> 
     assert flags[1]["stream"] is True
 
 
+def test_pagehide_keeps_a_live_mic_signed_in() -> None:
+    import json
+    import subprocess
+    from pathlib import Path
+
+    source = (
+        Path(__file__).resolve().parents[2] / "src" / "static" / "index.html"
+    ).read_text(encoding="utf-8")
+    start = source.index("function shouldFlushOnPageHide(")
+    end = source.index("window.addEventListener('pagehide'", start)
+    script = "\n".join(
+        [
+            "var USER = 'alice.jones@example.com';",
+            "var window = { csVoiceOn: false };",
+            source[start:end],
+            "const idle = shouldFlushOnPageHide({ persisted: false });",
+            "const frozen = shouldFlushOnPageHide({ persisted: true });",
+            "window.csVoiceOn = true;",
+            "const speaking = shouldFlushOnPageHide({ persisted: false });",
+            "USER = null;",
+            "window.csVoiceOn = false;",
+            "const signedOut = shouldFlushOnPageHide({ persisted: false });",
+            "console.log(JSON.stringify({ idle, frozen, speaking, signedOut }));",
+        ]
+    )
+    proc = subprocess.run(["node", "-"], input=script, text=True, capture_output=True, check=False)
+    assert proc.returncode == 0, proc.stderr
+    result = json.loads(proc.stdout)
+    assert result == {"idle": True, "frozen": False, "speaking": False, "signedOut": False}
+
+
 def test_barge_in_only_while_the_agent_is_speaking() -> None:
     import json
     import subprocess
@@ -652,6 +683,23 @@ def test_more_speech_does_not_cancel_the_answer_in_progress(monkeypatch) -> None
 
     assert queries == ["hi hello"]
     assert events[-1] == {"type": "turn_end"}
+
+
+def test_session_check_follows_the_live_runner() -> None:
+    from fastapi.testclient import TestClient
+
+    import src.api.web as web
+
+    web._runners["alice.jones@example.com"] = object()
+    try:
+        client = TestClient(web.app)
+        live = client.post("/api/session", json={"user_id": "alice.jones@example.com"})
+        gone = client.post("/api/session", json={"user_id": "nobody@example.com"})
+    finally:
+        web._runners.pop("alice.jones@example.com", None)
+    assert live.status_code == 200
+    assert live.json()["ok"] is True
+    assert gone.status_code == 401
 
 
 @pytest.mark.skipif(not os.getenv("GOOGLE_API_KEY"), reason="GOOGLE_API_KEY is not set")
