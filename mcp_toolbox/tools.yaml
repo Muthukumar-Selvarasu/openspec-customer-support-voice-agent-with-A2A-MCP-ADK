@@ -1,0 +1,98 @@
+# MCP Toolbox catalog for the local PoC.
+# Host pytest and the host Toolbox process use 127.0.0.1:5432.
+# Group 7 rewrites the Postgres host to the compose service name `postgres`.
+
+sources:
+  cs-postgres:
+    kind: postgres
+    host: 127.0.0.1
+    port: 5432
+    database: toolbox_db
+    user: toolbox_user
+    password: mysecretpassword
+
+tools:
+  get-order-status:
+    kind: postgres-sql
+    source: cs-postgres
+    description: >
+      Get one order for the authenticated customer. Both the order id and the
+      customer email are required so another shopper's row cannot be returned
+      by order id alone.
+    parameters:
+      - name: order_id
+        type: integer
+        description: The numeric order ID, for example 4.
+      - name: customer_email
+        type: string
+        description: The authenticated customer's email, for example alice.jones@example.com.
+    statement: |
+      SELECT order_id, customer_email, status, delivery_address, items, order_date, total_amount
+      FROM customer_orders
+      WHERE order_id = $1 AND customer_email = $2;
+
+  find-customer-orders:
+    kind: postgres-sql
+    source: cs-postgres
+    description: >
+      Find all orders for a customer by email address, most recent first.
+    parameters:
+      - name: email
+        type: string
+        description: The customer's email address, for example alice.jones@example.com.
+    statement: |
+      SELECT order_id, status, delivery_address, items, order_date, total_amount
+      FROM customer_orders
+      WHERE customer_email = $1
+      ORDER BY order_date DESC;
+
+  update-order-status:
+    kind: postgres-sql
+    source: cs-postgres
+    description: >
+      Directly update an order's status. Restricted: the support agent records
+      intended changes with action-log instead of calling this tool. It stays
+      in the catalog so compliance tests can see the write path.
+    parameters:
+      - name: order_id
+        type: integer
+        description: The numeric order ID.
+      - name: status
+        type: string
+        description: New status. One of PROCESSING, SHIPPED, DELIVERED, CANCELLED, RETURNED.
+    statement: |
+      UPDATE customer_orders
+      SET status = $2
+      WHERE order_id = $1
+      RETURNING order_id, status;
+
+  action-log:
+    kind: postgres-sql
+    source: cs-postgres
+    description: >
+      Record an intended action (cancel, return, status change, address or
+      profile update) for later processing. This is the mutation path the
+      support agent is supposed to use.
+    parameters:
+      - name: user_email
+        type: string
+        description: The authenticated user's email.
+      - name: action_type
+        type: string
+        description: The action type, for example CANCEL_ORDER, RETURN_ORDER, UPDATE_ADDRESS, UPDATE_PROFILE.
+      - name: parameters
+        type: string
+        description: >
+          A JSON string with the relevant context, such as order_id, the
+          previous status, the requested status, items, or a new address.
+    statement: |
+      INSERT INTO actions_log (user_email, action_type, parameters)
+      VALUES ($1, $2, $3::jsonb)
+      RETURNING id, timestamp, action_type;
+
+toolsets:
+  cs_agent_tools:
+    - get-order-status
+    - find-customer-orders
+    - update-order-status
+    - action-log
