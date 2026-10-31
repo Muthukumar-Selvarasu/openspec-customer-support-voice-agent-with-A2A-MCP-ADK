@@ -1,0 +1,21 @@
+services:
+  postgres:
+    image: docker.io/library/postgres:16
+    environment:
+      POSTGRES_DB: toolbox_db
+      POSTGRES_USER: toolbox_user
+      POSTGRES_PASSWORD: mysecretpassword
+    ports:
+      - "5432:5432"
+    volumes:
+      - cs_postgres_data:/var/lib/postgresql/data
+      - ./mcp_toolbox/seed.sql:/docker-entrypoint-initdb.d/01-seed.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U toolbox_user -d toolbox_db"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 5s
+
+volumes:
+  cs_postgres_data:
