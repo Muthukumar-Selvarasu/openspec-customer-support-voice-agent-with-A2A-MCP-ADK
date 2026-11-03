@@ -246,9 +246,12 @@ class SecurityBlocker:
         }
 
 
+_BLOCKER = SecurityBlocker()
+
+
 def evaluate_prompt(query: str) -> str:
     """Return ``BLOCKED`` or ``PASS`` for ``query``."""
-    result = SecurityBlocker().evaluate_query(query)
+    result = _BLOCKER.evaluate_query(query)
     if result["matches"]:
         logger.warning("Malicious content detected in query: %s", query)
     return result["status"]

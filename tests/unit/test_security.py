@@ -67,6 +67,24 @@ def test_blocker_uses_preprocessed_query() -> None:
     assert result["status"] == "BLOCKED"
 
 
+def test_blocker_caches_singleton_for_evaluate_prompt() -> None:
+    from src.security import blocker as blocker_mod
+
+    assert isinstance(blocker_mod._BLOCKER, SecurityBlocker)
+    assert blocker_mod.evaluate_prompt("Where is order 3?") == "PASS"
+    assert blocker_mod.evaluate_prompt("DROP TABLE orders;") == "BLOCKED"
+
+
+async def test_a2a_client_reuses_shared_client_session() -> None:
+    from src.a2a import client as a2a_client
+
+    s1 = a2a_client._get_session()
+    s2 = a2a_client._get_session()
+    assert s1 is s2
+    assert not s1.closed
+    await s1.close()
+
+
 _PII_EXAMPLES = {
     "EMAIL_ADDRESS": "alice@example.com",
     "PHONE_NUMBER": "415-555-2671",
@@ -108,7 +126,10 @@ def test_masker_keeps_multibyte_punctuation_around_email_and_street() -> None:
 
 
 def test_masker_leaves_order_status_tokens() -> None:
-    text = "Order 4 is PROCESSING. Status SHIPPED. Premium DELIVERED CANCELLED RETURNED."
+    text = (
+        "Order 4 is PROCESSING. Status SHIPPED. Premium DELIVERED CANCELLED RETURNED. "
+        "Items: Wireless Mouse, Mechanical Keyboard, Ergonomic Office Chair, Coffee Beans, Descaling Kit."
+    )
     assert mask_sensitive_data(text) == text
 
 

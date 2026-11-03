@@ -191,6 +191,8 @@ def test_prompt_matches_tools_yaml_parameter_names() -> None:
     assert "authenticated shopper" in text
     assert "confirm" in text.lower()
     assert "read tools first" in text.lower() or "use read tools first" in text.lower()
+    assert "always use the `search_memory` function" not in text.lower()
+    assert "concise" in text.lower()
 
 
 def test_telemetry_false_is_noop_and_does_not_import_phoenix(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import uuid
@@ -10,6 +11,19 @@ from typing import Any
 import aiohttp
 
 logger = logging.getLogger(__name__)
+
+_session: aiohttp.ClientSession | None = None
+_session_loop: asyncio.AbstractEventLoop | None = None
+
+
+def _get_session() -> aiohttp.ClientSession:
+    """Return an open ``aiohttp.ClientSession`` bound to the running event loop."""
+    global _session, _session_loop
+    loop = asyncio.get_running_loop()
+    if _session is None or _session.closed or _session_loop is not loop:
+        _session = aiohttp.ClientSession()
+        _session_loop = loop
+    return _session
 
 
 def _payload(method: str, query: str, task_id: str, session_id: str) -> dict[str, Any]:
@@ -57,13 +71,13 @@ async def call_a2a_agent(query: str, host: str, port: int, stream: bool = False)
 
 async def _call_sync(query: str, url: str, task_id: str, session_id: str) -> str:
     payload = _payload("tasks/send", query, task_id, session_id)
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url, json=payload) as response:
-            if response.status != 200:
-                error_text = await response.text()
-                logger.error("Error calling agent: %s", error_text)
-                raise RuntimeError(f"Error calling agent: {error_text}")
-            result = await response.json()
+    session = _get_session()
+    async with session.post(url, json=payload) as response:
+        if response.status != 200:
+            error_text = await response.text()
+            logger.error("Error calling agent: %s", error_text)
+            raise RuntimeError(f"Error calling agent: {error_text}")
+        result = await response.json()
     if "error" in result:
         logger.error("Agent returned error: %s", result["error"])
         raise RuntimeError(f"Agent error: {result['error']['message']}")
@@ -73,21 +87,21 @@ async def _call_sync(query: str, url: str, task_id: str, session_id: str) -> str
 async def _call_stream(query: str, url: str, task_id: str, session_id: str) -> str:
     payload = _payload("tasks/sendSubscribe", query, task_id, session_id)
     result_text = ""
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url, json=payload) as response:
-            if response.status != 200:
-                error_text = await response.text()
-                logger.error("Error calling agent: %s", error_text)
-                raise RuntimeError(f"Error calling agent: {error_text}")
-            async for raw in response.content:
-                line = raw.decode("utf-8").strip()
-                if not line.startswith("data: "):
-                    continue
-                data = json.loads(line[6:])
-                artifact = (data.get("result") or {}).get("artifact")
-                if not artifact:
-                    continue
-                text = _text_from_parts(artifact.get("parts") or [])
-                if text:
-                    result_text = text
+    session = _get_session()
+    async with session.post(url, json=payload) as response:
+        if response.status != 200:
+            error_text = await response.text()
+            logger.error("Error calling agent: %s", error_text)
+            raise RuntimeError(f"Error calling agent: {error_text}")
+        async for raw in response.content:
+            line = raw.decode("utf-8").strip()
+            if not line.startswith("data: "):
+                continue
+            data = json.loads(line[6:])
+            artifact = (data.get("result") or {}).get("artifact")
+            if not artifact:
+                continue
+            text = _text_from_parts(artifact.get("parts") or [])
+            if text:
+                result_text = text
     return result_text

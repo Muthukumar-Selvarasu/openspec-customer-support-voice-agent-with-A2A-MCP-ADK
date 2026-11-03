@@ -287,6 +287,18 @@ def test_run_sh_compose_publishes_cascade_ports_and_one_a2a_process() -> None:
         assert port in published, port
 
 
+def test_phoenix_auth_stays_off_in_compose_and_runtime_copy() -> None:
+    compose_text = _text("compose.yaml")
+    compose = yaml.safe_load(compose_text)
+    assert compose["services"]["phoenix"]["environment"]["PHOENIX_ENABLE_AUTH"] == "false"
+    old = '    ports:\n      - "5000:5000"\n'
+    assert old in compose_text
+    runtime = yaml.safe_load(compose_text.replace(old, "", 1))
+    assert runtime["services"]["phoenix"]["environment"]["PHOENIX_ENABLE_AUTH"] == "false"
+    toolbox_ports = runtime["services"]["mcp-toolbox"].get("ports") or []
+    assert "5000:5000" not in [str(item) for item in toolbox_ports]
+
+
 def test_readme_documents_local_podman_launch() -> None:
     readme = _text("README.md")
     assert "podman compose" in readme

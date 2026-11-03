@@ -150,6 +150,10 @@
     <button type="button" id="modeExplain" class="mode-btn on" aria-pressed="true">Explain</button>
     <button type="button" id="modeQuick" class="mode-btn" aria-pressed="false">Quick</button>
   </div>
+  <div class="mode" id="guardrailToggles" role="group" aria-label="Security guardrails">
+    <button type="button" id="toggleJudge" class="mode-btn on" aria-pressed="true" title="Toggle A2A Security Judge">Judge: ON</button>
+    <button type="button" id="toggleMask" class="mode-btn on" aria-pressed="true" title="Toggle A2A Data Masker">Masker: ON</button>
+  </div>
   <a id="archLink" class="logout" href="/architecture" target="arch">Architecture ↗</a>
   <button type="button" id="logout" class="logout" style="display:none">Sign out</button>
 </header>
@@ -172,10 +176,11 @@
 
 <footer id="footer" style="display:none">
   <div class="inwrap">
-    <textarea id="input" rows="1" placeholder="Ask about your orders… or tap the mic"></textarea>
+    <textarea id="input" rows="1" placeholder="Ask about your orders… or hold the mic to speak"></textarea>
     <button type="button" id="send">Send</button>
   </div>
   <div class="status" id="voiceStatus"></div>
+  <div class="hint" id="pttHint">🎙 <strong>Click and hold the Mic button</strong> (or hold <code>Tab</code>) to speak with the Agent — release when done.</div>
   <div class="hint">Voice: speech → STT → [ sanitize → A2A Security Judge → agent + MCP tools + Mem0 → A2A Data Masker ] → TTS → speech. Typed turns run the same bracketed pipeline.</div>
 </footer>
 
@@ -225,6 +230,45 @@ function setDemoMode(mode){
 applyDemoMode(demoMode());
 document.getElementById("modeExplain").onclick=()=>setDemoMode("explain");
 document.getElementById("modeQuick").onclick=()=>setDemoMode("quick");
+function judgeEnabled(){
+  return localStorage["cs-judge"]!=="off";
+}
+function maskEnabled(){
+  return localStorage["cs-mask"]!=="off";
+}
+function applyGuardrails(){
+  const j=judgeEnabled(), m=maskEnabled();
+  const jb=document.getElementById("toggleJudge");
+  const mb=document.getElementById("toggleMask");
+  if(jb){
+    jb.classList.toggle("on", j);
+    jb.setAttribute("aria-pressed", String(j));
+    jb.textContent=j?"Judge: ON":"Judge: OFF";
+  }
+  if(mb){
+    mb.classList.toggle("on", m);
+    mb.setAttribute("aria-pressed", String(m));
+    mb.textContent=m?"Masker: ON":"Masker: OFF";
+  }
+}
+function syncGuardrails(){
+  applyGuardrails();
+  if(window.csSendGuardrails) window.csSendGuardrails();
+  if(USER&&typeof fetch==="function"){
+    fetch('/api/guardrails',{method:'POST',headers:{'content-type':'application/json'},
+      body:JSON.stringify({user_id:USER, judge:judgeEnabled(), mask:maskEnabled()})}).catch(()=>{});
+  }
+}
+applyGuardrails();
+document.getElementById("toggleJudge").onclick=()=>{
+  localStorage["cs-judge"]=judgeEnabled()?"off":"on";
+  syncGuardrails();
+};
+document.getElementById("toggleMask").onclick=()=>{
+  localStorage["cs-mask"]=maskEnabled()?"off":"on";
+  syncGuardrails();
+};
+window.addEventListener("cs:login",()=>syncGuardrails());
 const col=document.getElementById('col');
 const footer=document.getElementById('footer');
 const who=document.getElementById('who');
@@ -304,7 +348,12 @@ function meta(span,ms,extra){
 function addRow(node,html,key){
   const d=stepsPanel(node);
   const row=el(`<div class="step"${key?` data-key="${key}"`:''}>${html}</div>`);
-  d.appendChild(row);
+  let before=null;
+  if(key==='stt') before=d.querySelector('.step:not([data-key="stt"])');
+  else if(!key) before=d.querySelector('.step[data-key="mask"],.step[data-key="tts"]');
+  else if(key!=='tts') before=d.querySelector('.step[data-key="tts"]');
+  if(before) d.insertBefore(row,before);
+  else d.appendChild(row);
   d.querySelector('.pill').textContent=d.querySelectorAll('.step').length;
   scroll(); return row;
 }
@@ -412,7 +461,7 @@ function enterShop(d){
   document.getElementById('logout').style.display='inline-block';
   footer.style.display='block';
   if(!document.querySelector('.msg')){
-    col.appendChild(el(`<div class="msg assistant"><div class="role">Agent</div><div class="bubble">Hi ${esc(d.full_name)}! Tap the mic to talk, or type below. Ask about your orders — status, history, cancellations, or address changes.</div></div>`));
+    col.appendChild(el(`<div class="msg assistant"><div class="role">Agent</div><div class="bubble">Hi ${esc(d.full_name)}! Click and hold the mic (or hold Tab) to speak, or type below. Ask about your orders — status, history, cancellations, or address changes.</div></div>`));
     renderChips();
   }
   document.getElementById('input').focus();

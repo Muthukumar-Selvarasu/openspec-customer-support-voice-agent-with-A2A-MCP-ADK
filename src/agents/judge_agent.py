@@ -36,6 +36,9 @@ judge_agent = LlmAgent(
     instruction=JUDGE_INSTRUCTION,
     description="An agent that judges whether input contains security threats.",
     tools=[judge_tool],
+    generate_content_config=types.GenerateContentConfig(
+        thinking_config=types.ThinkingConfig(thinking_budget=0)
+    ),
 )
 
 judge_session_service = InMemorySessionService()

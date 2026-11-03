@@ -150,6 +150,7 @@ services:
     environment:
       PHOENIX_WORKING_DIR: /mnt/data
       PHOENIX_PORT: "6006"
+      PHOENIX_ENABLE_AUTH: "false"
     ports:
       - "6006:6006"
 

@@ -118,13 +118,34 @@ def resolve_demo_mode(mode: str | None) -> str:
     return "explain"
 
 
-def demo_pipeline_kwargs(mode: str | None, *, stream_endpoint: bool) -> dict[str, bool]:
-    """Per-turn flags. Quick skips Judge and Masker. Explain keeps the mask interlock."""
-    if resolve_demo_mode(mode) == "quick":
+_guardrails: dict[str, dict[str, bool]] = {}
+
+
+def demo_pipeline_kwargs(
+    mode: str | None,
+    *,
+    stream_endpoint: bool,
+    judge: bool | None = None,
+    mask: bool | None = None,
+    user_id: str | None = None,
+) -> dict[str, bool]:
+    """Per-turn flags. Quick skips Judge and Masker by default unless overridden."""
+    quick = resolve_demo_mode(mode) == "quick"
+    saved = _guardrails.get(user_id or "") or {}
+    if judge is None and "judge" in saved:
+        judge = saved["judge"]
+    if mask is None and "mask" in saved:
+        mask = saved["mask"]
+    do_judge = bool(judge) if judge is not None else (not quick)
+    do_mask = (
+        (bool(mask) and mask_enabled())
+        if mask is not None
+        else (False if quick else mask_enabled())
+    )
+    if quick and judge is None and mask is None:
         return {"judge": False, "mask": False, "stream": True}
-    do_mask = mask_enabled()
     return {
-        "judge": True,
+        "judge": do_judge,
         "mask": do_mask,
         "stream": (not do_mask) if stream_endpoint else False,
     }
@@ -286,6 +307,9 @@ def _build_runner(user_id: str) -> Runner:
         instruction=SQL_PROMPT_INSTRUCTION.format(USER_ID=user_id),
         tools=[*get_database_tools(), search_memory],
         before_tool_callback=_enforce_tenant_tool_callback,
+        generate_content_config=types.GenerateContentConfig(
+            thinking_config=types.ThinkingConfig(thinking_budget=0)
+        ),
     )
     return Runner(agent=agent, app_name=APP_NAME, session_service=session_service)
 
@@ -393,6 +417,7 @@ async def text_pipeline(
     turn_span=None,
     mask: bool | None = None,
     judge: bool = True,
+    judge_if_flagged: bool = False,
 ):
     """Run one turn and yield inspector events for chat and voice."""
     do_mask = mask_enabled() if mask is None else mask
@@ -433,7 +458,37 @@ async def text_pipeline(
         yield blocked("sanitizer", f"Input rejected by sanitizer: {reason}")
         return
 
-    if judge:
+    from src.security.blocker import evaluate_prompt
+
+    flagged_by_blocker = evaluate_prompt(clean) == "BLOCKED"
+    run_judge = judge
+    if run_judge and judge_if_flagged:
+        run_judge = flagged_by_blocker
+
+    content = types.Content(role="user", parts=[types.Part(text=clean)])
+    run_config = RunConfig(streaming_mode=StreamingMode.SSE) if stream else None
+    agent_queue: asyncio.Queue = asyncio.Queue()
+
+    async def _produce_agent_events() -> None:
+        try:
+            async for ev in runner.run_async(
+                user_id=user_id,
+                session_id=f"session_{user_id}",
+                new_message=content,
+                run_config=run_config,
+            ):
+                await agent_queue.put(("event", ev))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await agent_queue.put(("error", exc))
+        finally:
+            await agent_queue.put(("done", None))
+
+    agent_producer: asyncio.Task | None = None
+    if run_judge:
+        if not flagged_by_blocker:
+            agent_producer = asyncio.create_task(_produce_agent_events())
         yield {"type": "stage", "key": "judge", "stage": "A2A Security Judge"}
         t0 = time.perf_counter()
         with tracer.start_as_current_span("security.a2a_judge") as span:
@@ -442,6 +497,8 @@ async def text_pipeline(
             try:
                 ok, verdict = await _judge(clean)
             except Exception as exc:
+                if agent_producer is not None:
+                    agent_producer.cancel()
                 span.set_attribute(ATTR.OUTPUT_VALUE, f"error: {exc}")
                 yield {"type": "error", "error": f"Security Judge unreachable: {exc}"}
                 return
@@ -463,87 +520,98 @@ async def text_pipeline(
             text_chars=len(clean),
         )
         if not ok:
+            if agent_producer is not None:
+                agent_producer.cancel()
+                try:
+                    await agent_producer
+                except (asyncio.CancelledError, Exception):
+                    pass
             yield blocked("judge", "Blocked by the A2A Security Judge (possible injection/unsafe input).")
             return
 
+    if agent_producer is None:
+        agent_producer = asyncio.create_task(_produce_agent_events())
     yield {"type": "stage", "key": "agent", "stage": "Agent thinking"}
-    content = types.Content(role="user", parts=[types.Part(text=clean)])
-    run_config = RunConfig(streaming_mode=StreamingMode.SSE) if stream else None
     final_text, display, call_id, t0 = "", "", 0, time.perf_counter()
     pending: dict[str, list] = {}
     seen_partial = False
-    async for event in runner.run_async(
-        user_id=user_id,
-        session_id=f"session_{user_id}",
-        new_message=content,
-        run_config=run_config,
-    ):
-        partial = bool(getattr(event, "partial", False))
-        calls = [] if partial else (event.get_function_calls() or [])
-        if (
-            not partial
-            and event.author != "user"
-            and event.content
-            and (calls or event.is_final_response())
-        ):
-            usage = event.usage_metadata
-            decided = (
-                f"decided to call {', '.join(call.name for call in calls)}"
-                if calls
-                else "wrote the final answer"
+    try:
+        while True:
+            kind_tag, item = await agent_queue.get()
+            if kind_tag == "done":
+                break
+            if kind_tag == "error":
+                raise item
+            event = item
+            partial = bool(getattr(event, "partial", False))
+            calls = [] if partial else (event.get_function_calls() or [])
+            if (
+                not partial
+                and event.author != "user"
+                and event.content
+                and (calls or event.is_final_response())
+            ):
+                usage = event.usage_metadata
+                decided = (
+                    f"decided to call {', '.join(call.name for call in calls)}"
+                    if calls
+                    else "wrote the final answer"
+                )
+                yield {
+                    "type": "llm",
+                    "title": "Gemini",
+                    "detail": decided,
+                    "span": "call_llm",
+                    "model": AGENT_MODEL,
+                    "ms": _ms(t0),
+                    "tokens_in": getattr(usage, "prompt_token_count", None),
+                    "tokens_out": getattr(usage, "candidates_token_count", None),
+                }
+            for call in calls:
+                call_id += 1
+                args = {key: _decode(value) for key, value in (call.args or {}).items()}
+                pending.setdefault(call.name, []).append((call_id, time.perf_counter(), args))
+                yield {
+                    "type": "tool_call",
+                    "id": call_id,
+                    "name": call.name,
+                    "span": f"tool.{call.name}",
+                    "info": tool_info(call.name),
+                    "args": args,
+                }
+            for response in [] if partial else (event.get_function_responses() or []):
+                queued = pending.get(response.name) or [(None, time.perf_counter(), {})]
+                tool_id, started, args = queued.pop(0)
+                result = _unwrap(response.response)
+                with tracer.start_as_current_span(f"tool.{response.name}") as span:
+                    span.set_attribute(ATTR.OPENINFERENCE_SPAN_KIND, "TOOL")
+                    span.set_attribute(ATTR.TOOL_NAME, response.name)
+                    span.set_attribute(ATTR.INPUT_VALUE, json.dumps(args, default=str))
+                    span.set_attribute(ATTR.OUTPUT_VALUE, json.dumps(result, default=str)[:2000])
+                yield {
+                    "type": "tool_result",
+                    "id": tool_id,
+                    "name": response.name,
+                    "ms": _ms(started),
+                    "result": result,
+                }
+                yield {"type": "stage", "key": "agent", "stage": "Agent thinking"}
+                t0 = time.perf_counter()
+            text_part = (
+                event.content.parts[0].text if (event.content and event.content.parts) else None
             )
-            yield {
-                "type": "llm",
-                "title": "Gemini",
-                "detail": decided,
-                "span": "call_llm",
-                "model": AGENT_MODEL,
-                "ms": _ms(t0),
-                "tokens_in": getattr(usage, "prompt_token_count", None),
-                "tokens_out": getattr(usage, "candidates_token_count", None),
-            }
-        for call in calls:
-            call_id += 1
-            args = {key: _decode(value) for key, value in (call.args or {}).items()}
-            pending.setdefault(call.name, []).append((call_id, time.perf_counter(), args))
-            yield {
-                "type": "tool_call",
-                "id": call_id,
-                "name": call.name,
-                "span": f"tool.{call.name}",
-                "info": tool_info(call.name),
-                "args": args,
-            }
-        for response in [] if partial else (event.get_function_responses() or []):
-            queued = pending.get(response.name) or [(None, time.perf_counter(), {})]
-            tool_id, started, args = queued.pop(0)
-            result = _unwrap(response.response)
-            with tracer.start_as_current_span(f"tool.{response.name}") as span:
-                span.set_attribute(ATTR.OPENINFERENCE_SPAN_KIND, "TOOL")
-                span.set_attribute(ATTR.TOOL_NAME, response.name)
-                span.set_attribute(ATTR.INPUT_VALUE, json.dumps(args, default=str))
-                span.set_attribute(ATTR.OUTPUT_VALUE, json.dumps(result, default=str)[:2000])
-            yield {
-                "type": "tool_result",
-                "id": tool_id,
-                "name": response.name,
-                "ms": _ms(started),
-                "result": result,
-            }
-            yield {"type": "stage", "key": "agent", "stage": "Agent thinking"}
-            t0 = time.perf_counter()
-        text_part = (
-            event.content.parts[0].text if (event.content and event.content.parts) else None
-        )
-        if stream and text_part:
-            if partial:
-                seen_partial = True
-            elif seen_partial:
-                continue
-            display += text_part
-            yield {"type": "delta", "text": display}
-        if event.is_final_response() and event.content and event.content.parts:
-            final_text = event.content.parts[0].text or ""
+            if stream and text_part:
+                if partial:
+                    seen_partial = True
+                elif seen_partial:
+                    continue
+                display += text_part
+                yield {"type": "delta", "text": display}
+            if event.is_final_response() and event.content and event.content.parts:
+                final_text = event.content.parts[0].text or ""
+    finally:
+        if agent_producer is not None and not agent_producer.done():
+            agent_producer.cancel()
     if stream:
         final_text = display or final_text
 
@@ -583,6 +651,14 @@ class ChatReq(BaseModel):
     user_id: str
     message: str
     mode: str | None = None
+    judge: bool | None = None
+    mask: bool | None = None
+
+
+class GuardrailsReq(BaseModel):
+    user_id: str
+    judge: bool | None = None
+    mask: bool | None = None
 
 
 class LogoutReq(BaseModel):
@@ -658,8 +734,19 @@ async def page_leave(req: LogoutReq):
 @app.post("/api/logout")
 async def logout(req: LogoutReq):
     _seal_epoch(req.user_id)
+    _guardrails.pop(req.user_id, None)
     await _flush_shopper(req.user_id)
     return {"ok": True}
+
+
+@app.post("/api/guardrails")
+async def set_guardrails(req: GuardrailsReq):
+    entry = _guardrails.setdefault(req.user_id, {})
+    if req.judge is not None:
+        entry["judge"] = bool(req.judge)
+    if req.mask is not None:
+        entry["mask"] = bool(req.mask)
+    return {"ok": True, **entry}
 
 
 @app.post("/api/chat")
@@ -675,7 +762,13 @@ async def chat(req: ChatReq):
             req.user_id,
             req.message,
             turn_span=span,
-            **demo_pipeline_kwargs(req.mode, stream_endpoint=False),
+            **demo_pipeline_kwargs(
+                req.mode,
+                stream_endpoint=False,
+                judge=req.judge,
+                mask=req.mask,
+                user_id=req.user_id,
+            ),
         ):
             if event["type"] == "tool_call":
                 tool_calls.append({"name": event["name"], "args": event["args"], "result": None})
@@ -725,7 +818,13 @@ async def chat_stream(req: ChatReq):
                 req.user_id,
                 req.message,
                 turn_span=span,
-                **demo_pipeline_kwargs(req.mode, stream_endpoint=True),
+                **demo_pipeline_kwargs(
+                    req.mode,
+                    stream_endpoint=True,
+                    judge=req.judge,
+                    mask=req.mask,
+                    user_id=req.user_id,
+                ),
             ):
                 yield json.dumps(event, default=str) + "\n"
                 if event["type"] == "final" and not event["blocked"]:
@@ -739,7 +838,11 @@ async def chat_stream(req: ChatReq):
 
 @app.get("/")
 def index():
-    return FileResponse(_STATIC / "index.html", media_type="text/html")
+    return FileResponse(
+        _STATIC / "index.html",
+        media_type="text/html",
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @app.get("/architecture")
@@ -759,6 +862,7 @@ app.include_router(
         record=_record,
         trace_url=trace_url,
         mask_enabled=mask_enabled(),
+        mask_text=_mask,
     )
 )
 

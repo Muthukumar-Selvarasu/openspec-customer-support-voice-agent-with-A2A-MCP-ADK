@@ -148,6 +148,64 @@ async def test_pipeline_explain_calls_judge_and_masker(web, monkeypatch) -> None
     assert 'os.getenv("MASK", "true")' in inspect.getsource(web.mask_enabled)
 
 
+async def test_voice_explain_calls_judge_only_when_the_blocker_flags(web, monkeypatch) -> None:
+    counts = {"judge": 0}
+
+    async def judge(text: str) -> tuple[bool, str]:
+        counts["judge"] += 1
+        return True, text
+
+    async def mask(text: str) -> tuple[str, str]:
+        return text, "no PII found, response unchanged"
+
+    monkeypatch.setattr(web, "_judge", judge)
+    monkeypatch.setattr(web, "_mask", mask)
+
+    clean = [
+        event
+        async for event in web.text_pipeline(
+            _FakeRunner(),
+            USER,
+            "What is my last order?",
+            judge=True,
+            mask=True,
+            stream=True,
+            judge_if_flagged=True,
+        )
+    ]
+    assert ("step", "sanitize") in _keys(clean)
+    assert not any(event.get("key") == "judge" for event in clean)
+    assert counts["judge"] == 0
+    assert clean[-1]["type"] == "final"
+
+    flagged = [
+        event
+        async for event in web.text_pipeline(
+            _FakeRunner(),
+            USER,
+            "'; DROP TABLE users; --",
+            judge=True,
+            mask=False,
+            stream=True,
+            judge_if_flagged=True,
+        )
+    ]
+    assert any(event.get("key") == "judge" for event in flagged)
+    assert counts["judge"] == 1
+
+    typed = [
+        event
+        async for event in web.text_pipeline(
+            _FakeRunner(),
+            USER,
+            "What is my last order?",
+            **web.demo_pipeline_kwargs("explain", stream_endpoint=True),
+        )
+    ]
+    assert any(event.get("key") == "judge" for event in typed)
+    assert counts["judge"] == 2
+
+
 def test_pipeline_chat_endpoints_pass_mode(web, monkeypatch) -> None:
     from fastapi.testclient import TestClient
 
@@ -383,3 +441,136 @@ def test_toggle_defaults_to_explain_persists_and_hides_the_step_list() -> None:
     assert "thinking…" not in result["quickDelta"]["html"]
     assert result["quickFinal"]["html"] == "Your order is SHIPPED."
     assert result["quickFinal"]["posted"] == 1
+
+
+def test_guardrails_toggles_override_judge_and_mask_in_both_explain_and_quick(web) -> None:
+    from fastapi.testclient import TestClient
+
+    html = INDEX.read_text(encoding="utf-8")
+    voice = VOICE_UI.read_text(encoding="utf-8")
+    assert 'id="toggleJudge"' in html
+    assert 'id="toggleMask"' in html
+    assert "window.csSendGuardrails = sendGuardrails" in voice
+
+    web._guardrails.clear()
+    client = TestClient(web.app)
+    resp = client.post(
+        "/api/guardrails",
+        json={"user_id": USER, "judge": True, "mask": True},
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True, "judge": True, "mask": True}
+    # In Quick mode, explicit user guardrails enable Judge & Masker
+    assert web.demo_pipeline_kwargs("quick", stream_endpoint=True, user_id=USER) == {
+        "judge": True,
+        "mask": True,
+        "stream": False,
+    }
+    # In Explain mode, explicit user guardrails can disable Judge & Masker
+    client.post(
+        "/api/guardrails",
+        json={"user_id": USER, "judge": False, "mask": False},
+    )
+    assert web.demo_pipeline_kwargs("explain", stream_endpoint=True, user_id=USER) == {
+        "judge": False,
+        "mask": False,
+        "stream": True,
+    }
+    web._guardrails.clear()
+
+
+async def test_parallel_judge_and_agent_cancels_agent_on_block(web, monkeypatch) -> None:
+    import asyncio
+
+    agent_started = asyncio.Event()
+
+    class _ConcurrentRunner:
+        async def run_async(self, **kwargs):
+            agent_started.set()
+            await asyncio.sleep(0.05)
+            yield _FinalEvent()
+
+    async def judge_pass(text: str) -> tuple[bool, str]:
+        # Wait until _ConcurrentRunner starts in parallel before returning!
+        await asyncio.wait_for(agent_started.wait(), timeout=1.0)
+        return True, text
+
+    async def judge_block(text: str) -> tuple[bool, str]:
+        await asyncio.wait_for(agent_started.wait(), timeout=1.0)
+        return False, "BLOCKED"
+
+    monkeypatch.setattr(web, "_judge", judge_pass)
+    passed_events = [
+        ev
+        async for ev in web.text_pipeline(
+            _ConcurrentRunner(),
+            USER,
+            "Where is order 4?",
+            judge=True,
+            mask=False,
+            stream=True,
+        )
+    ]
+    assert passed_events[-1] == {"type": "final", "blocked": False, "response": ANSWER}
+
+    agent_started.clear()
+    monkeypatch.setattr(web, "_judge", judge_block)
+    blocked_events = [
+        ev
+        async for ev in web.text_pipeline(
+            _ConcurrentRunner(),
+            USER,
+            "Where is order 4?",
+            judge=True,
+            mask=False,
+            stream=True,
+        )
+    ]
+    assert blocked_events[-1]["type"] == "final"
+    assert blocked_events[-1]["blocked"] is True
+    assert blocked_events[-1]["stage"] == "judge"
+    assert not any(ev["type"] in ("llm", "delta") for ev in blocked_events)
+
+
+def test_what_happened_orders_stt_first_and_llm_before_tts() -> None:
+    html = INDEX.read_text(encoding="utf-8")
+    voice = VOICE_UI.read_text(encoding="utf-8")
+    assert '(data.type === "stage" || data.type === "step") && data.key === "stt"' in voice
+    script = "\n".join(
+        [
+            "const rows = [];",
+            "const pill = { textContent: '0' };",
+            "const panel = {",
+            "  querySelector(sel) {",
+            "    if (sel === '.pill') return pill;",
+            "    if (sel === '.step:not([data-key=\"stt\"])') return rows.find(r => r.key !== 'stt') || null;",
+            "    if (sel === '.step[data-key=\"mask\"],.step[data-key=\"tts\"]') return rows.find(r => r.key === 'mask' || r.key === 'tts') || null;",
+            "    if (sel === '.step[data-key=\"tts\"]') return rows.find(r => r.key === 'tts') || null;",
+            "    return null;",
+            "  },",
+            "  querySelectorAll() { return rows; },",
+            "  appendChild(row) { rows.push(row); },",
+            "  insertBefore(row, before) {",
+            "    const idx = rows.indexOf(before);",
+            "    if (idx >= 0) rows.splice(idx, 0, row);",
+            "    else rows.push(row);",
+            "  },",
+            "};",
+            "function stepsPanel() { return panel; }",
+            "function el(html) {",
+            "  const m = html.match(/data-key=\"([^\"]+)\"/);",
+            "  return { html, key: m ? m[1] : null };",
+            "}",
+            "function scroll() {}",
+            _extract_function(html, "function addRow("),
+            "addRow({}, 'sanitize', 'sanitize');",
+            "addRow({}, 'tts-start', 'tts');",
+            "addRow({}, 'gemini-llm', undefined);",
+            "addRow({}, 'mask-step', 'mask');",
+            "addRow({}, 'stt-step', 'stt');",
+            "console.log(JSON.stringify(rows.map(r => r.key || 'llm')));",
+        ]
+    )
+    proc = subprocess.run(["node", "-"], input=script, text=True, capture_output=True, check=False)
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == ["stt", "sanitize", "llm", "mask", "tts"]

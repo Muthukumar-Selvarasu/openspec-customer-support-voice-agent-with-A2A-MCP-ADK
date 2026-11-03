@@ -121,6 +121,7 @@ async def test_voice_turn_streams_tts_pcm_after_settle() -> None:
             timeout=timeout,
         ) as ws:
             await ws.send_bytes(pcm)
+            await ws.send_str(json.dumps({"type": "utterance_end"}))
             loop = asyncio.get_running_loop()
             deadline = loop.time() + 170
             while loop.time() < deadline:

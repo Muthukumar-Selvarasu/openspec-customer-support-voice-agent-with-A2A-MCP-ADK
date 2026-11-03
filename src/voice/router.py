@@ -14,7 +14,7 @@ from fastapi.responses import FileResponse
 
 from src.core.telemetry import ATTR, get_tracer
 from src.voice import cost
-from src.voice.stt import STT_MODEL, transcribe
+from src.voice.stt import live_model, open_utterance
 from src.voice.tts import TTS_MODEL, TTS_SAMPLE_RATE, TTS_VOICE, synthesize_stream
 
 _UI_JS = Path(__file__).resolve().parent / "ui.js"
@@ -23,6 +23,8 @@ _SETTLE_MS = 1500
 _QUICK_SETTLE_MS = 400
 _BYTES_PER_SEC = TTS_SAMPLE_RATE * 2
 _SENT_END = re.compile(r"[.!?…](?:[\"')\]]+)?(?:\s|$)")
+_CLAUSE_END = re.compile(r"[:;]\s+|\n+")
+_MIN_CLAUSE_CHARS = 24
 
 
 def _flag(name: str, default: str) -> bool:
@@ -75,10 +77,14 @@ def print_config_warnings() -> None:
 
 def _take_complete(buf: str) -> tuple[str, str]:
     matches = list(_SENT_END.finditer(buf))
-    if not matches:
-        return "", buf
-    cut = matches[-1].end()
-    return buf[:cut], buf[cut:]
+    if matches:
+        cut = matches[-1].end()
+        return buf[:cut], buf[cut:]
+    for match in reversed(list(_CLAUSE_END.finditer(buf))):
+        if match.end() >= _MIN_CLAUSE_CHARS:
+            cut = match.end()
+            return buf[:cut], buf[cut:]
+    return "", buf
 
 
 def _ms(t0: float) -> int:
@@ -92,6 +98,7 @@ def make_voice_router(
     record=None,
     trace_url=None,
     mask_enabled=None,
+    mask_text=None,
 ) -> APIRouter:
     """Build the ``/voice/ws`` router. ``pipeline`` is the text turn generator."""
     refresh_flags()
@@ -101,7 +108,11 @@ def make_voice_router(
 
     @router.get("/voice/ui.js", include_in_schema=False)
     def ui_js():
-        return FileResponse(_UI_JS, media_type="application/javascript")
+        return FileResponse(
+            _UI_JS,
+            media_type="application/javascript",
+            headers={"Cache-Control": "no-store"},
+        )
 
     @router.websocket("/voice/ws")
     async def voice_ws(ws: WebSocket):
@@ -114,12 +125,18 @@ def make_voice_router(
 
         pending = ""
         connection_mode = "explain"
+        judge_override: bool | None = None
+        mask_override: bool | None = None
         stt_acc = {"in": 0, "out": 0}
         stt_time = {"sec": 0.0}
         agent_task: asyncio.Task | None = None
         settle_task: asyncio.Task | None = None
         stt_lock = asyncio.Lock()
         ws_send_lock = asyncio.Lock()
+        live = None
+        live_reader: asyncio.Task | None = None
+        live_text = ""
+        live_started = 0.0
 
         async def send_json(obj: dict) -> None:
             async with ws_send_lock:
@@ -138,9 +155,13 @@ def make_voice_router(
         async def run_agent(text: str, turn_mode: str) -> None:
             nonlocal pending
             quick = turn_mode == "quick"
-            turn_stream = True if quick else STREAM_ENABLED
-            turn_mask = False if quick else do_mask
-            turn_judge = not quick
+            turn_stream = True
+            turn_mask = (
+                (bool(mask_override) and do_mask)
+                if mask_override is not None
+                else (False if quick else do_mask)
+            )
+            turn_judge = bool(judge_override) if judge_override is not None else (not quick)
             answer_text = ""
             timing: dict[str, float] = {}
             agent_tok = {"in": 0, "out": 0}
@@ -243,6 +264,60 @@ def make_voice_router(
                 tts_queue: asyncio.Queue | None = None
                 worker = None
                 tts_buffer = ""
+                raw_seen = ""
+                sentence_buf = ""
+                shown = ""
+                masked_once = False
+
+                async def speak_masked(segment: str) -> None:
+                    nonlocal shown, masked_once, tts_t0, tts_queue, worker, pending
+                    text = segment.strip()
+                    if not text:
+                        return
+                    if mask_text is None:
+                        spoken, note = text, "response unchanged"
+                    else:
+                        spoken, note = await mask_text(text)
+                        spoken = spoken or text
+                    if not masked_once:
+                        masked_once = True
+                        mask_t0 = time.perf_counter()
+                        await send_json({"type": "stage", "key": "mask", "stage": "A2A Data Masker"})
+                        await send_json(
+                            {
+                                "type": "step",
+                                "key": "mask",
+                                "title": "Data Masker",
+                                "status": "passed",
+                                "detail": note,
+                                "span": "security.a2a_mask",
+                                "ms": 1,
+                                "kind": "A2A",
+                            }
+                        )
+                        clock("mask", mask_t0)
+                    shown = f"{shown} {spoken}".strip() if shown else spoken
+                    if tts_queue is None:
+                        pending = ""
+                        tts_t0 = time.perf_counter()
+                        tts_queue = asyncio.Queue()
+                        worker = asyncio.create_task(tts_worker())
+                        await send_json({"type": "stage", "key": "tts", "stage": "Speaking"})
+                    await send_json(
+                        {"type": "response_text", "text": shown, "tool_calls": tool_calls}
+                    )
+                    tts_queue.put_nowait(spoken)
+
+                async def absorb_masked(full: str) -> None:
+                    nonlocal raw_seen, sentence_buf
+                    if not full:
+                        return
+                    added = full[len(raw_seen) :] if full.startswith(raw_seen) else full
+                    raw_seen = full
+                    sentence_buf += added
+                    head, sentence_buf = _take_complete(sentence_buf)
+                    if head.strip():
+                        await speak_masked(head)
 
                 async def tts_worker() -> None:
                     while True:
@@ -265,6 +340,7 @@ def make_voice_router(
                         turn_span=span,
                         mask=turn_mask,
                         judge=turn_judge,
+                        judge_if_flagged=False,
                     ):
                         kind = event["type"]
                         if kind == "stage":
@@ -296,31 +372,43 @@ def make_voice_router(
                                     call["result"] = json.dumps(event["result"], default=str)[:800]
                                     break
                         elif kind == "delta":
-                            if "agent_end" not in timing and not display:
-                                pending = ""
-                                tts_t0 = time.perf_counter()
-                                tts_queue = asyncio.Queue()
-                                worker = asyncio.create_task(tts_worker())
-                                await send_json({"type": "stage", "key": "tts", "stage": "Speaking"})
-                            new = event["text"][len(display) :]
-                            display = event["text"]
-                            tts_buffer += new
-                            await send_json(
-                                {
-                                    "type": "response_text",
-                                    "text": display.strip(),
-                                    "tool_calls": tool_calls,
-                                }
-                            )
-                            head, tts_buffer = _take_complete(tts_buffer)
-                            if head.strip() and tts_queue is not None:
-                                tts_queue.put_nowait(head)
+                            pending = ""
+                            if turn_mask:
+                                await absorb_masked(event["text"])
+                            else:
+                                if "agent_end" not in timing and not display:
+                                    tts_t0 = time.perf_counter()
+                                    tts_queue = asyncio.Queue()
+                                    worker = asyncio.create_task(tts_worker())
+                                    await send_json({"type": "stage", "key": "tts", "stage": "Speaking"})
+                                new = event["text"][len(display) :]
+                                display = event["text"]
+                                tts_buffer += new
+                                await send_json(
+                                    {
+                                        "type": "response_text",
+                                        "text": display.strip(),
+                                        "tool_calls": tool_calls,
+                                    }
+                                )
+                                head, tts_buffer = _take_complete(tts_buffer)
+                                if head.strip() and tts_queue is not None:
+                                    tts_queue.put_nowait(head)
                         elif kind == "final":
                             if event["blocked"]:
                                 blocked = event
                             else:
+                                pending = ""
                                 display = event["response"]
+                                if turn_mask:
+                                    await absorb_masked(display)
+                                    if sentence_buf.strip():
+                                        await speak_masked(sentence_buf)
+                                        sentence_buf = ""
+                                    event = {**event, "response": shown or display}
                             mark("agent_end")
+                        if kind == "delta" and turn_mask:
+                            continue
                         await send_json(event)
 
                     if blocked:
@@ -336,18 +424,18 @@ def make_voice_router(
                         return
 
                     if turn_stream and tts_queue is not None:
-                        if tts_buffer.strip():
+                        if tts_buffer.strip() and not turn_mask:
                             tts_queue.put_nowait(tts_buffer)
                         tts_queue.put_nowait(None)
                         await worker
                         await send_json(
                             {
                                 "type": "response_text",
-                                "text": display.strip(),
+                                "text": (shown or display).strip(),
                                 "tool_calls": tool_calls,
                             }
                         )
-                        await send_json(tts_step(first_audio, len(display)))
+                        await send_json(tts_step(first_audio, len(shown or display)))
                     else:
                         await send_json(
                             {
@@ -386,10 +474,11 @@ def make_voice_router(
                     while current.uncancel():
                         pass
                 span.set_attribute("turn.interrupted", True)
-                try:
-                    await send_json({"type": "turn_end", "reason": "interrupted"})
-                except (WebSocketDisconnect, RuntimeError):
-                    return
+                if agent_task is None or agent_task is current:
+                    try:
+                        await send_json({"type": "turn_end", "reason": "interrupted"})
+                    except (WebSocketDisconnect, RuntimeError):
+                        return
                 raise
             except Exception as exc:
                 message = str(exc)[:300]
@@ -411,28 +500,127 @@ def make_voice_router(
 
         def restart_settle() -> None:
             nonlocal settle_task
-            if agent_task and not agent_task.done():
+            if turn_running():
                 return
             if settle_task and not settle_task.done():
                 settle_task.cancel()
             turn_mode = connection_mode
             settle_task = asyncio.create_task(settle_then_run(turn_mode))
 
-        async def handle_burst(pcm: bytes) -> None:
-            nonlocal pending
+        def commit_now() -> None:
+            nonlocal agent_task, settle_task
+            if turn_running():
+                return
             if settle_task and not settle_task.done():
                 settle_task.cancel()
+            query = pending.strip()
+            if query:
+                agent_task = asyncio.create_task(run_agent(query, connection_mode))
+
+        async def read_live(session) -> None:
+            nonlocal live_text
+            try:
+                async for text in session.updates():
+                    live_text = text
+                    shown = f"{pending} {text}".strip() if pending else text
+                    await send_json({"type": "partial_transcript", "text": shown})
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                message = str(exc)[:300]
+                await send_json({"type": "error", "message": message, "error": message})
+
+        async def close_live() -> None:
+            nonlocal live, live_reader
+            session = live
+            reader = live_reader
+            live = None
+            live_reader = None
+            if session is not None:
+                await session.close()
+            if reader is not None and not reader.done():
+                reader.cancel()
+
+        def turn_running() -> bool:
+            if agent_task is None or agent_task.done():
+                return False
+            cancelling = getattr(agent_task, "cancelling", None)
+            return not (cancelling and cancelling())
+
+        async def _open_live_locked() -> bool:
+            nonlocal live, live_reader, live_text, live_started
+            session = open_utterance()
+            try:
+                await session.open()
+            except Exception as exc:
+                message = str(exc)[:300]
+                await send_json({"type": "error", "message": message, "error": message})
+                return False
+            live = session
+            live_text = ""
+            live_started = time.perf_counter()
             await send_json({"type": "stage", "key": "stt", "stage": "Transcribing"})
-            started = time.perf_counter()
+            live_reader = asyncio.create_task(read_live(session))
+            return True
+
+        async def on_audio(pcm: bytes) -> None:
+            nonlocal live, live_reader, live_text, live_started
+            if turn_running():
+                return
+            if settle_task and not settle_task.done():
+                settle_task.cancel()
             async with stt_lock:
-                text, stt_usage = await transcribe(pcm)
+                if live is not None and live_reader is not None and live_reader.done():
+                    await close_live()
+                if live is None:
+                    if not await _open_live_locked():
+                        return
+                elif live_started == 0.0:
+                    live_started = time.perf_counter()
+                try:
+                    await live.send(pcm)
+                except Exception:
+                    await close_live()
+                    if not await _open_live_locked():
+                        return
+                    try:
+                        await live.send(pcm)
+                    except Exception as exc:
+                        message = str(exc)[:300]
+                        await send_json({"type": "error", "message": message, "error": message})
+                        return
+                await asyncio.sleep(0)
+
+        async def on_utterance_end(commit: bool = False) -> None:
+            nonlocal pending, live_text, live_started
+            async with stt_lock:
+                session = live
+                reader = live_reader
+                started = live_started or time.perf_counter()
+                if session is None:
+                    if commit and pending.strip():
+                        commit_now()
+                    elif commit:
+                        await send_json({"type": "turn_end", "reason": "empty"})
+                    return
+                try:
+                    text, stt_usage, pcm_bytes = await session.flush(reader)
+                except Exception as exc:
+                    message = str(exc)[:300]
+                    await send_json({"type": "error", "message": message, "error": message})
+                    return
+                text = (text or live_text or "").strip()
+                live_text = ""
+                live_started = 0.0
                 stt_time["sec"] += time.perf_counter() - started
-            tokens_in, tokens_out = cost.usage_tokens(stt_usage)
-            audio_sec = len(pcm) / 32000
-            if text:
-                detail = f"transcribed {audio_sec:.1f} s of speech → “{text}”"
-            else:
-                detail = f"heard {audio_sec:.1f} s of audio but recognized no speech"
+            if not text:
+                if commit and pending.strip():
+                    commit_now()
+                elif commit:
+                    await send_json({"type": "turn_end", "reason": "empty"})
+                return
+            tokens_in, tokens_out = cost.stt_charge(stt_usage, pcm_bytes)
+            audio_sec = pcm_bytes / 32000
             extra = f"{tokens_in:,} in / {tokens_out:,} out tokens" if tokens_in or tokens_out else None
             await send_json(
                 {
@@ -440,23 +628,27 @@ def make_voice_router(
                     "key": "stt",
                     "title": "Speech to text",
                     "status": "passed",
-                    "detail": detail,
+                    "detail": f"transcribed {audio_sec:.1f} s of speech → “{text}”",
                     "span": "stt",
                     "ms": _ms(started),
                     "kind": "Voice",
-                    "runs": f"{STT_MODEL} · audio in, text out",
+                    "runs": f"{live_model()} · audio in, text out",
                     "extra": extra,
                 }
             )
-            if text:
-                pending = f"{pending} {text}".strip() if pending else text
-                stt_acc["in"] += tokens_in
-                stt_acc["out"] += tokens_out
-                await send_json({"type": "partial_transcript", "text": pending})
-            restart_settle()
+            pending = f"{pending} {text}".strip() if pending else text
+            stt_acc["in"] += tokens_in
+            stt_acc["out"] += tokens_out
+            await send_json({"type": "partial_transcript", "text": pending})
+            if commit:
+                commit_now()
+            else:
+                restart_settle()
 
         def stop_answer() -> None:
-            nonlocal agent_task
+            nonlocal agent_task, settle_task
+            if settle_task and not settle_task.done():
+                settle_task.cancel()
             if agent_task and not agent_task.done():
                 agent_task.cancel()
 
@@ -466,7 +658,7 @@ def make_voice_router(
                 if message.get("type") == "websocket.disconnect":
                     break
                 if message.get("bytes") is not None:
-                    asyncio.create_task(handle_burst(message["bytes"]))
+                    await on_audio(message["bytes"])
                 elif message.get("text"):
                     try:
                         data = json.loads(message["text"])
@@ -474,11 +666,23 @@ def make_voice_router(
                         continue
                     if data.get("type") == "mode":
                         connection_mode = normalize_demo_mode(data.get("mode"))
+                        if "judge" in data and data["judge"] is not None:
+                            judge_override = bool(data["judge"])
+                        if "mask" in data and data["mask"] is not None:
+                            mask_override = bool(data["mask"])
+                    elif data.get("type") == "guardrails":
+                        if "judge" in data and data["judge"] is not None:
+                            judge_override = bool(data["judge"])
+                        if "mask" in data and data["mask"] is not None:
+                            mask_override = bool(data["mask"])
+                    elif data.get("type") == "utterance_end":
+                        await on_utterance_end(commit=bool(data.get("commit")))
                     elif data.get("type") == "interrupt":
                         stop_answer()
         except WebSocketDisconnect:
             pass
         finally:
+            await close_live()
             for task in (agent_task, settle_task):
                 if task and not task.done():
                     task.cancel()
