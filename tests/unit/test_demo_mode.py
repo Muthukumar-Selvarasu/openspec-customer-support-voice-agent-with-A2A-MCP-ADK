@@ -295,6 +295,9 @@ def test_toggle_defaults_to_explain_persists_and_hides_the_step_list() -> None:
     header = html.split("<header>", 1)[1].split("</header>", 1)[0]
     explain = header.split('id="modeExplain"', 1)[1].split("</button>", 1)[0]
     quick = header.split('id="modeQuick"', 1)[1].split("</button>", 1)[0]
+    assert 'id="demoMode"' in header and 'style="display:none"' in header.split('id="demoMode"', 1)[1].split(">", 1)[0]
+    assert 'id="guardrailToggles"' in header and 'style="display:none"' in header.split('id="guardrailToggles"', 1)[1].split(">", 1)[0]
+    assert "display:none" not in header.split('id="archLink"', 1)[1].split(">", 1)[0]
     assert ">Explain" in explain
     assert "mode-btn on" in explain
     assert 'aria-pressed="true"' in explain

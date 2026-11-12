@@ -111,11 +111,15 @@ def _page_script() -> str:
             "const footer = { style: { display: 'none' } };",
             "const loginEl = { removed: false, remove() { this.removed = true; } };",
             "const logoutEl = { style: { display: 'none' } };",
+            "const demoModeEl = { style: { display: 'none' } };",
+            "const guardrailEl = { style: { display: 'none' } };",
             "const input = { focus() {} };",
             "const document = {",
             "  getElementById(id) {",
             "    if (id === 'login') return loginEl.removed ? null : loginEl;",
             "    if (id === 'logout') return logoutEl;",
+            "    if (id === 'demoMode') return demoModeEl;",
+            "    if (id === 'guardrailToggles') return guardrailEl;",
             "    if (id === 'input') return input;",
             "    return null;",
             "  },",
@@ -179,6 +183,8 @@ def test_page_restore_confirms_session_and_leave_does_not_log_out() -> None:
             "    who: who.textContent,",
             "    footer: footer.style.display,",
             "    login: loginEl.removed,",
+            "    demo: demoModeEl.style.display,",
+            "    guard: guardrailEl.style.display,",
             "  };",
             "  epoch = 'epoch-live';",
             "  USER = 'alice.jones@example.com';",
@@ -204,6 +210,8 @@ def test_page_restore_confirms_session_and_leave_does_not_log_out() -> None:
     assert "Alice Jones" in result["kept"]["who"]
     assert result["kept"]["footer"] == "block"
     assert result["kept"]["login"] is True
+    assert result["kept"]["demo"] == "flex"
+    assert result["kept"]["guard"] == "flex"
     assert result["normal"]["url"] == "/api/page-leave"
     assert result["normal"]["body"]["epoch"] == "epoch-live"
     assert result["frozen"] is None

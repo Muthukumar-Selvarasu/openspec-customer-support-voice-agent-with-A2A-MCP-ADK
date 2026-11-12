@@ -9,7 +9,7 @@ Groups 1–7 build and prove the cascade locally (`podman compose` / `./run.sh`,
 - Add Railway service definitions for `mcp-toolbox`, `a2a-judge`, `a2a-masker`, `web-voice-app`, and optional `phoenix`. Postgres is **Neon**, not a Railway Postgres plugin.
 - Wire `DATABASE_URL` to the Neon pooled connection string (`sslmode=require`) as a Railway secret. Wire `TOOLBOX_URL` / `A2A_*` / `PHOENIX_URL` to Railway private hostnames. Public HTTPS only on `web-voice-app` (`0.0.0.0:$PORT`).
 - Apply Group 1 schema/seed to Neon once with `CREATE TABLE IF NOT EXISTS` / idempotent inserts.
-- Document CLI login / `RAILWAY_TOKEN` as a later, skippable step.
+- Keep two run paths. Local stays `./run.sh` and does not need `RAILWAY_TOKEN`. A Railway deploy reads `RAILWAY_TOKEN` from `.env`, or uses an existing `railway whoami` session. `.env.example` lists `RAILWAY_TOKEN=` with no value. Deploy stays skippable until the token is set or the CLI is already logged in.
 - When auth is present, deploy and smoke-test `GET /` on the public web URL.
 
 ## Capabilities
@@ -22,8 +22,8 @@ Groups 1–7 build and prove the cascade locally (`podman compose` / `./run.sh`,
 ## Impact
 
 - `railway.toml` (or equivalent Railway config)
-- README Railway + Neon deploy section
-- Optional `RAILWAY_TOKEN` in operator docs only (never committed)
+- README Railway + Neon deploy section, including local `./run.sh` and Railway as the two run paths
+- `.env.example` documents an empty `RAILWAY_TOKEN=`. The real token stays in `.env` and is never committed
 
 ## Channels
 

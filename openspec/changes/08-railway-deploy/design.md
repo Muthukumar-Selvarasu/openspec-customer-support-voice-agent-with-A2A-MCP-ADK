@@ -43,7 +43,7 @@ Do not add a Railway Postgres plugin. Create (or reuse) a Neon project, copy the
 Do not run destructive `DROP TABLE` seed on every Railway restart. Apply Group 1 schema to Neon with `CREATE TABLE IF NOT EXISTS` / idempotent inserts, or a one-shot setup job.
 
 ### Decision 6: Auth methods
-Prefer `railway login` (browser or device code) when an operator is present. Prefer `RAILWAY_TOKEN` in CI. Neither is required to finish config tasks.
+The real `RAILWAY_TOKEN` lives in `.env` and is gitignored. `.env.example` has `RAILWAY_TOKEN=` and no value. Local `./run.sh` does not use that token. A Railway deploy reads `RAILWAY_TOKEN` from `.env`, or uses an existing `railway whoami` session. Config tasks finish without either. The running app does not read `RAILWAY_TOKEN`.
 
 ## Risks / Trade-offs
 
@@ -56,7 +56,7 @@ Prefer `railway login` (browser or device code) when an operator is present. Pre
 
 1. Finish Group 7 local cascade on Podman (text + voice).
 2. Commit Railway config (no Postgres plugin).
-3. When the operator supplies login or `RAILWAY_TOKEN`, create the project, set Neon `DATABASE_URL` + API keys, deploy.
+3. When `.env` has `RAILWAY_TOKEN`, or `railway whoami` already succeeds, create the project, set Neon `DATABASE_URL` + API keys, deploy.
 4. Smoke `GET /`. Rollback is undeploy / previous Railway deployment.
 
 ## Open Questions

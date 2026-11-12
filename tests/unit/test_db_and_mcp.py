@@ -317,6 +317,23 @@ def test_readme_documents_local_podman_launch() -> None:
     assert not _DOCKER_CLI.search(readme)
 
 
+def test_railway_config_lists_services_without_a_database_plugin() -> None:
+    config = _text(".railway/railway.py")
+    for name in ("mcp-toolbox", "a2a-judge", "a2a-masker", "web-voice-app"):
+        assert f'"{name}"' in config
+    assert "postgres(" not in config
+    assert "Dockerfile" in config
+    assert "python -m src.api.web" in config
+    example = _text(".env.example")
+    assert re.search(r"^RAILWAY_TOKEN=$", example, flags=re.MULTILINE)
+    assert ".env" in _text(".gitignore")
+    readme = _text("README.md")
+    assert "./run.sh" in readme
+    assert "RAILWAY_TOKEN" in readme
+    assert "Neon" in readme
+    assert "mysecretpassword@" not in readme.split("## Railway", 1)[-1]
+
+
 def test_postgres_podman_seed_counts() -> None:
     info = _podman("info")
     if info.returncode != 0:

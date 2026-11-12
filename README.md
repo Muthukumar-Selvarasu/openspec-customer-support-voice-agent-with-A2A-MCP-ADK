@@ -95,3 +95,13 @@ pytest tests/unit tests/integration tests/evals
 ```
 
 Live Gemini and Postgres checks skip when those services or API keys are unset.
+
+## Railway
+
+Local `./run.sh` stays the local path. It does not read `RAILWAY_TOKEN` and does not need a cloud project.
+
+Railway is the hosted path. It uses Neon for Postgres, not a Railway Postgres plugin. Create a Neon project, copy the pooled `DATABASE_URL` (`sslmode=require`) into the Railway secrets for `web-voice-app` and `mcp-toolbox`, and apply `mcp_toolbox/seed.sql` once to the Neon direct URL. That file recreates the demo tables, so it is a one-shot setup, not a command on every restart.
+
+Put `RAILWAY_TOKEN` in `.env` when you want the CLI to deploy without a browser login. `.env.example` has an empty `RAILWAY_TOKEN=` line. The real token stays in `.env` and is never committed. Deploy when that token is set or `railway whoami` already succeeds.
+
+The public app is `web-voice-app` at `https://customer-support-voice-agent.up.railway.app`. `mcp-toolbox`, `a2a-judge`, `a2a-masker`, and `phoenix` stay on the private network. `GOOGLE_API_KEY` and `MEM0_API_KEY` are Railway secrets, not files in git.

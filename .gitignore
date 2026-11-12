@@ -18,3 +18,6 @@ __pycache__/
 # Local runtime (Podman helper config, service logs)
 .run/
 compose.runtime.yaml
+
+# Local knowledge graph cache
+graphify-out/

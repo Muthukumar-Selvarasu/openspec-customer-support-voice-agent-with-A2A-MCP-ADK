@@ -35,6 +35,17 @@ On Railway, `web-voice-app` and `mcp-toolbox` SHALL use a Neon pooled `DATABASE_
 - **WHEN** Railway CLI is not authenticated and `RAILWAY_TOKEN` is unset
 - **THEN** config files still exist and the deploy step is skipped rather than failing the change
 
+#### Scenario: Example env names the token and has no value
+- **WHEN** `.env.example` is inspected
+- **THEN** it contains `RAILWAY_TOKEN=` and that line has no token value
+
+### Requirement: Local run stays available
+The local stack SHALL still start with `./run.sh` and SHALL NOT require `RAILWAY_TOKEN`. A Railway deploy SHALL use `RAILWAY_TOKEN` from `.env` or an existing CLI login.
+
+#### Scenario: Local start does not need Railway
+- **WHEN** the operator runs the local stack
+- **THEN** `./run.sh` starts it without `RAILWAY_TOKEN`
+
 ### Requirement: Post-Deploy Public Smoke Check
 After a successful deploy, `GET` on the public `web-voice-app` origin SHALL return 200 for `/`.
 

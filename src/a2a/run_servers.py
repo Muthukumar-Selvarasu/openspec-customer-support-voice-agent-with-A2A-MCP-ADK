@@ -101,11 +101,53 @@ def start_all_servers(
     return threads
 
 
+def selected_role() -> str | None:
+    """Return ``judge`` or ``masker`` when this process should serve only one.
+
+    Unset ``A2A_ONLY`` keeps the local behavior: both servers in one process.
+    """
+    role = os.getenv("A2A_ONLY", "").strip().lower()
+    if role in {"judge", "masker"}:
+        return role
+    return None
+
+
+def serve_one(role: str) -> None:
+    """Bind one A2A server to ``0.0.0.0:$PORT`` and block."""
+    from src.agents.judge_agent import call_judge_agent
+    from src.agents.mask_agent import call_mask_agent
+    from src.a2a.factories import create_judge_server, create_mask_server
+
+    port = int(os.environ["PORT"])
+    if role == "judge":
+        server = create_judge_server(
+            host="0.0.0.0",
+            port=port,
+            call_judge_agent=call_judge_agent,
+        )
+    else:
+        server = create_mask_server(
+            host="0.0.0.0",
+            port=port,
+            call_mask_agent=call_mask_agent,
+        )
+    _run_server(server)
+
+
 def main() -> None:
-    """Bind both servers from the environment and wait until interrupted."""
+    """Bind both servers from the environment and wait until interrupted.
+
+    ``A2A_ONLY=judge`` or ``A2A_ONLY=masker`` serves that one factory on
+    ``0.0.0.0:$PORT`` for a Railway service. Local compose leaves ``A2A_ONLY``
+    unset and still starts both.
+    """
     from dotenv import load_dotenv
 
     load_dotenv()
+    role = selected_role()
+    if role is not None:
+        serve_one(role)
+        return
     threads = start_all_servers()
     logger.info("Press Ctrl+C to stop.")
     try:

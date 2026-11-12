@@ -146,11 +146,11 @@
   <span class="dot"></span>
   <h1>Customer Support Agent <small>· cascade voice agent (STT → pipeline → TTS)</small></h1>
   <span class="who" id="who"></span>
-  <div class="mode" id="demoMode" role="group" aria-label="Demo response mode">
+  <div class="mode" id="demoMode" role="group" aria-label="Demo response mode" style="display:none">
     <button type="button" id="modeExplain" class="mode-btn on" aria-pressed="true">Explain</button>
     <button type="button" id="modeQuick" class="mode-btn" aria-pressed="false">Quick</button>
   </div>
-  <div class="mode" id="guardrailToggles" role="group" aria-label="Security guardrails">
+  <div class="mode" id="guardrailToggles" role="group" aria-label="Security guardrails" style="display:none">
     <button type="button" id="toggleJudge" class="mode-btn on" aria-pressed="true" title="Toggle A2A Security Judge">Judge: ON</button>
     <button type="button" id="toggleMask" class="mode-btn on" aria-pressed="true" title="Toggle A2A Data Masker">Masker: ON</button>
   </div>
@@ -458,6 +458,8 @@ function enterShop(d){
   who.textContent=`${d.full_name||''}${d.is_premium?' · premium':''}${d.model?' · '+d.model:''}`;
   const loginEl=document.getElementById('login');
   if(loginEl) loginEl.remove();
+  document.getElementById('demoMode').style.display='flex';
+  document.getElementById('guardrailToggles').style.display='flex';
   document.getElementById('logout').style.display='inline-block';
   footer.style.display='block';
   if(!document.querySelector('.msg')){
