@@ -4,47 +4,38 @@
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>Cascade Architecture</title>
+<link rel="stylesheet" href="/theme.css"/>
 <style>
-  :root{
-    --bg:#f7f8fa; --panel:#ffffff; --panel-2:#f1f3f6; --line:#e4e7ec;
-    --text:#1a1d23; --muted:#6b7280; --accent:#0f9aae;
-  }
-  *{box-sizing:border-box}
-  body{margin:0;font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
-       background:var(--bg);color:var(--text)}
-  header{padding:14px 20px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:10px;background:var(--panel)}
-  header .dot{width:9px;height:9px;border-radius:50%;background:var(--accent);box-shadow:0 0 10px var(--accent)}
-  header h1{font-size:15px;font-weight:600;margin:0}
+  body{margin:0;font:15px/1.6 var(--sans);background:var(--paper);color:var(--ink)}
+  header{padding:12px 24px}
   header nav{margin-left:auto;display:flex;gap:10px}
-  header a{color:var(--muted);text-decoration:none;border:1px solid var(--line);border-radius:9px;padding:5px 12px;font-size:13px}
-  header a:hover{color:var(--text);border-color:var(--muted)}
-  .wrap{max-width:1180px;margin:0 auto;padding:22px 20px 40px}
-  .card{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:18px 20px}
-  .cap{display:flex;flex-wrap:wrap;gap:16px;align-items:center;font-size:12px;color:var(--muted);margin-bottom:10px}
+  .wrap{max-width:1180px;margin:0 auto;padding:24px 20px 40px}
+  .card{background:var(--paper);border:1px solid var(--line);border-radius:var(--radius);padding:20px 22px;box-shadow:var(--lift)}
+  .cap{display:flex;flex-wrap:wrap;gap:16px;align-items:center;font-size:12px;color:var(--ink-2);margin-bottom:12px}
   .cap .live{margin-left:auto;display:inline-flex;align-items:center;gap:6px}
-  .cap .live i{width:8px;height:8px;border-radius:50%;background:var(--line)}
-  .cap .live.on i{background:var(--accent);box-shadow:0 0 8px var(--accent)}
+  .cap .live i{width:8px;height:8px;border-radius:50%;background:var(--line-2)}
+  .cap .live.on i{background:var(--green);box-shadow:0 0 8px rgba(47,125,74,.45)}
   .lg{display:inline-flex;align-items:center;gap:6px}
-  .sw{width:18px;height:10px;border-radius:3px;border:1.5px solid var(--muted)}
+  .sw{width:18px;height:10px;border-radius:3px;border:1.5px solid var(--ink-3)}
   .sw.d{border-style:dashed}
-  .sw.v{border-color:#d98bb5}
-  .sw.on{border-color:var(--accent);background:#e7f7f9}
-  .sw.x{border-color:#d9534f;background:#fdecea}
+  .sw.v{border-color:var(--gold-ink);background:var(--gold-bg)}
+  .sw.on{border-color:var(--teal);background:var(--bg-mist)}
+  .sw.x{border-color:var(--coral-ink);background:var(--warn-bg)}
   #svg svg{display:block;width:100%;height:auto}
-  h2{font-size:12px;text-transform:uppercase;letter-spacing:.8px;color:var(--muted);margin:24px 0 8px;font-weight:600}
-  #log{font:12.5px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;max-height:300px;overflow:auto;padding:12px 16px}
+  h2{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:var(--ink-3);margin:24px 0 8px;font-weight:600}
+  #log{font:12.5px/1.5 var(--mono);max-height:300px;overflow:auto;padding:14px 18px;border-radius:var(--radius-sm);box-shadow:none}
   #log .row{display:flex;gap:12px;padding:2px 0}
-  #log .t{color:var(--muted);flex:none}
-  #log .k{flex:none;width:92px;color:var(--accent)}
-  #log .k.x{color:#d9534f}
-  #log .empty{color:var(--muted);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+  #log .t{color:var(--ink-3);flex:none}
+  #log .k{flex:none;width:92px;color:var(--teal)}
+  #log .k.x{color:var(--coral-ink)}
+  #log .empty{color:var(--ink-3);font-family:var(--sans)}
 </style>
 </head>
 <body>
-<header>
-  <span class="dot"></span>
-  <h1>Customer Support Agent · Cascade architecture</h1>
-  <nav><a href="/" target="chat">Open chat</a><a href="http://localhost:6006" target="phoenix">Open Phoenix</a></nav>
+<header class="ds-header">
+  <span class="ds-dot"></span>
+  <h1>Customer Support Agent <small>· Cascade architecture</small></h1>
+  <nav><button type="button" id="themeToggle" class="pill--ghost" aria-label="Toggle color theme">Dark</button><a class="pill--ghost" href="/" target="chat">Open chat</a><a class="pill--ghost" href="http://localhost:6006" target="phoenix">Open Phoenix</a></nav>
 </header>
 
 <div class="wrap">
@@ -131,6 +122,22 @@ ch.onmessage=({data})=>{
   $('live').classList.add('on'); $('liveText').textContent='connected to chat';
   log(data); light(data);
 };
+function applyTheme(t){
+  const theme=t==='dark'?'dark':'light';
+  document.documentElement.setAttribute('data-theme',theme);
+  const btn=$('themeToggle');
+  if(btn){
+    btn.textContent=theme==='dark'?'Light':'Dark';
+    btn.setAttribute('aria-pressed',String(theme==='dark'));
+  }
+}
+applyTheme(localStorage['cs-theme']||'light');
+$('themeToggle').onclick=()=>{
+  const next=(document.documentElement.getAttribute('data-theme')==='dark')?'light':'dark';
+  localStorage['cs-theme']=next;
+  applyTheme(next);
+};
+window.addEventListener('storage',(e)=>{if(e.key==='cs-theme')applyTheme(e.newValue||'light');});
 </script>
 </body>
 </html>

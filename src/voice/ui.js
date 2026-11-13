@@ -644,11 +644,12 @@
     }
   };
   window.addEventListener("keydown", (event) => {
-    if (event.key !== "Tab" || event.repeat) return;
-    const tag = (document.activeElement && document.activeElement.tagName) || "";
-    if (tag === "INPUT" || tag === "TEXTAREA") return;
+    if (event.key !== "Tab") return;
     if (typeof USER === "undefined" || !USER) return;
+    const tag = (document.activeElement && document.activeElement.tagName) || "";
+    if (!tabHeld && (tag === "INPUT" || tag === "TEXTAREA")) return;
     event.preventDefault();
+    if (event.repeat) return;
     tabHeld = true;
     if (!voiceOn) {
       startVoice({ ptt: true })

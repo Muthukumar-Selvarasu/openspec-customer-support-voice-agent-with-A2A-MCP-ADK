@@ -845,6 +845,11 @@ def index():
     )
 
 
+@app.get("/theme.css")
+def theme_css():
+    return FileResponse(_STATIC / "theme.css", media_type="text/css")
+
+
 @app.get("/architecture")
 def architecture_page():
     return FileResponse(_STATIC / "architecture.html", media_type="text/html")
