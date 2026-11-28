@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+from array import array
 import io
 import os
 import re
+import sys
 import time
 import wave
 from functools import lru_cache
@@ -81,7 +83,21 @@ def _live_config() -> types.LiveConnectConfig:
 
 _FLUSH_DRAIN_SEC = 0.25
 _INTERIM_FINALIZE_SEC = 0.7
+_SPEECH_FLUSH_WAIT_SEC = 2.5
+_SPEECH_PEAK_THRESHOLD = 200  # ~-44 dBFS on 16-bit PCM; distinguishes speech from silence
 _END_SILENCE_PCM = b"\x00" * 32000  # 1.0 s of 16 kHz mono 16-bit PCM silence for Live VAD
+
+
+def _pcm_has_speech(pcm: bytes) -> bool:
+    """True when 16-bit little-endian PCM contains non-silent speech energy."""
+    usable = len(pcm) - (len(pcm) % 2)
+    if usable <= 0:
+        return False
+    samples = array("h")
+    samples.frombytes(pcm[:usable])
+    if sys.byteorder != "little":
+        samples.byteswap()
+    return max(abs(min(samples)), abs(max(samples))) >= _SPEECH_PEAK_THRESHOLD
 
 
 class LiveUtterance:
@@ -101,6 +117,7 @@ class LiveUtterance:
         self._last_rx = 0.0
         self._turn_done = False
         self._vad_active = False
+        self._has_speech = False
         self._session = None
         self._cm = None
         self._span_cm = None
@@ -170,6 +187,8 @@ class LiveUtterance:
 
     async def send(self, pcm: bytes) -> None:
         self.pcm_bytes += len(pcm)
+        if not self._has_speech and _pcm_has_speech(pcm):
+            self._has_speech = True
         await self._session.send_realtime_input(
             audio=types.Blob(data=pcm, mime_type=_PCM_MIME)
         )
@@ -209,18 +228,25 @@ class LiveUtterance:
     async def flush(self, reader: asyncio.Task | None = None):
         """End this phrase and return its transcript. The connection stays open."""
         phrase_bytes = self.pcm_bytes
+        had_speech = self._has_speech or self._vad_active
         self.pcm_bytes = 0
+        self._has_speech = False
         if phrase_bytes == 0 and not self._new_piece():
             usage = self.usage
             self.usage = None
             return "", usage, 0
         seq_before = self._seq
         self._turn_done = False
-        pad_silence = phrase_bytes >= 3200 and not self._new_piece()
+        pad_silence = phrase_bytes >= 3200 and had_speech and not self._new_piece()
         await self._end_audio(pad_silence=pad_silence)
         loop = asyncio.get_running_loop()
         start = loop.time()
-        max_wait = _INTERIM_FINALIZE_SEC if self._new_piece() else _FLUSH_DRAIN_SEC
+        if self._new_piece():
+            max_wait = _INTERIM_FINALIZE_SEC
+        elif pad_silence:
+            max_wait = _SPEECH_FLUSH_WAIT_SEC
+        else:
+            max_wait = _FLUSH_DRAIN_SEC
         deadline = start + max_wait
         while loop.time() < deadline:
             piece = self._new_piece()

@@ -314,17 +314,21 @@ def make_voice_router(
                 sentence_buf = ""
                 shown = ""
                 masked_once = False
+                mask_any_redacted = False
+                mask_last_note = "no PII found, response unchanged"
                 mask_elapsed_sec = 0.0
                 mask_in_chars = 0
                 mask_out_chars = 0
 
                 async def speak_masked(segment: str) -> None:
-                    nonlocal shown, masked_once, tts_t0, tts_queue, worker, pending
+                    nonlocal shown, masked_once, mask_any_redacted, mask_last_note
+                    nonlocal tts_t0, tts_queue, worker, pending
                     nonlocal mask_elapsed_sec, mask_in_chars, mask_out_chars
                     seg = segment.strip()
                     if not seg:
                         return
                     if not masked_once:
+                        masked_once = True
                         await send_json({"type": "stage", "key": "mask", "stage": "A2A Data Masker"})
                     seg_t0 = time.perf_counter()
                     with tracer.start_as_current_span("security.a2a_mask") as mspan:
@@ -339,25 +343,14 @@ def make_voice_router(
                     mask_elapsed_sec += time.perf_counter() - seg_t0
                     mask_in_chars += len(seg)
                     mask_out_chars += len(spoken)
+                    if spoken.strip() != seg.strip():
+                        mask_any_redacted = True
+                        mask_last_note = note
+                    elif not mask_any_redacted:
+                        mask_last_note = note
                     timing["mask"] = round(mask_elapsed_sec, 3)
                     mask_tok["in"] = max(1, mask_in_chars // 4)
                     mask_tok["out"] = max(1, mask_out_chars // 4)
-                    if not masked_once:
-                        masked_once = True
-                        await send_json(
-                            {
-                                "type": "step",
-                                "key": "mask",
-                                "title": "Data Masker",
-                                "status": "passed",
-                                "detail": note,
-                                "span": "security.a2a_mask",
-                                "ms": int(round(mask_elapsed_sec * 1000)),
-                                "kind": "A2A",
-                                "in_chars": mask_in_chars,
-                                "out_chars": mask_out_chars,
-                            }
-                        )
                     shown = f"{shown} {spoken}".strip() if shown else spoken
                     if tts_queue is None:
                         pending = ""
@@ -475,6 +468,21 @@ def make_voice_router(
                                     if sentence_buf.strip():
                                         await speak_masked(sentence_buf)
                                         sentence_buf = ""
+                                    if masked_once:
+                                        await send_json(
+                                            {
+                                                "type": "step",
+                                                "key": "mask",
+                                                "title": "Data Masker",
+                                                "status": "passed",
+                                                "detail": mask_last_note,
+                                                "span": "security.a2a_mask",
+                                                "ms": int(round(mask_elapsed_sec * 1000)),
+                                                "kind": "A2A",
+                                                "in_chars": mask_in_chars,
+                                                "out_chars": mask_out_chars,
+                                            }
+                                        )
                                     event = {**event, "response": shown or display}
                             mark("agent_end")
                         if kind == "delta" and turn_mask:
@@ -602,12 +610,20 @@ def make_voice_router(
                 async for text in session.updates():
                     live_text = text
                     shown = f"{pending} {text}".strip() if pending else text
-                    await send_json({"type": "partial_transcript", "text": shown})
+                    try:
+                        await send_json({"type": "partial_transcript", "text": shown})
+                    except (WebSocketDisconnect, RuntimeError):
+                        return
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                if getattr(session, "_closed", False):
+                    return
                 message = str(exc)[:300]
-                await send_json({"type": "error", "message": message, "error": message})
+                try:
+                    await send_json({"type": "error", "message": message, "error": message})
+                except (WebSocketDisconnect, RuntimeError):
+                    return
 
         async def close_live() -> None:
             nonlocal live, live_reader
@@ -615,10 +631,15 @@ def make_voice_router(
             reader = live_reader
             live = None
             live_reader = None
-            if session is not None:
-                await session.close()
             if reader is not None and not reader.done():
                 reader.cancel()
+            if session is not None:
+                await session.close()
+            if reader is not None:
+                try:
+                    await reader
+                except (asyncio.CancelledError, Exception):
+                    pass
 
         def turn_running() -> bool:
             if agent_task is None or agent_task.done():

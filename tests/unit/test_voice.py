@@ -2204,3 +2204,185 @@ def test_ptt_cs_voice_on_tracks_active_capture_and_resets_when_idle() -> None:
         "duringTail": True,
         "afterIdle": False,
     }
+
+
+def test_live_utterance_waits_for_delayed_speech_transcript_but_caps_silent_flush(
+    monkeypatch,
+) -> None:
+    import asyncio
+    import time
+    from types import SimpleNamespace
+
+    from src.voice import stt
+
+    class Session:
+        def __init__(self) -> None:
+            self.audio: list[bytes] = []
+            self.ended = False
+            self.closed = False
+
+        async def send_realtime_input(self, *, audio=None, audio_stream_end=None, **kwargs):
+            if audio is not None:
+                self.audio.append(bytes(audio.data))
+            if audio_stream_end:
+                self.ended = True
+
+        async def receive(self):
+            while not self.closed:
+                if self.ended and self.audio and self.audio[-1] == stt._END_SILENCE_PCM:
+                    self.ended = False
+                    # Exceeds _FLUSH_DRAIN_SEC (0.25s) to prove speech audio uses _SPEECH_FLUSH_WAIT_SEC.
+                    await asyncio.sleep(0.45)
+                    yield SimpleNamespace(
+                        usage_metadata=None,
+                        voice_activity=None,
+                        server_content=SimpleNamespace(
+                            input_transcription=SimpleNamespace(
+                                text="What is the status of my order 4?",
+                                finished=True,
+                            ),
+                            interim_input_transcription=None,
+                        ),
+                    )
+                    break
+                await asyncio.sleep(0.01)
+            while not self.closed:
+                await asyncio.sleep(0.01)
+
+    session = Session()
+
+    class Connect:
+        async def __aenter__(self):
+            return session
+
+        async def __aexit__(self, *args):
+            session.closed = True
+            return False
+
+    class Client:
+        aio = SimpleNamespace(live=SimpleNamespace(connect=lambda **kwargs: Connect()))
+
+    monkeypatch.setattr(stt, "_client", lambda: Client())
+
+    async def run() -> None:
+        utter = stt.open_utterance()
+        await utter.open()
+        reader = asyncio.create_task(_drain(utter))
+
+        # Real non-silent speech waits past 0.25s for Gemini Live transcription.
+        speech = b"\x01\x02" * 4000
+        await utter.send(speech)
+        text, _usage, nbytes = await utter.flush(reader)
+        assert text == "What is the status of my order 4?"
+        assert nbytes == len(speech)
+
+        # Pure silence still drains within 0.25s (< 0.35s).
+        await utter.send(b"\x00\x00" * 3200)
+        t0 = time.perf_counter()
+        quiet, _usage, qbytes = await utter.flush(reader)
+        elapsed = time.perf_counter() - t0
+        assert quiet == ""
+        assert qbytes == 6400
+        assert elapsed < 0.35
+
+        await utter.close()
+        reader.cancel()
+
+    async def _drain(utter) -> None:
+        async for _ in utter.updates():
+            pass
+
+    asyncio.run(run())
+
+
+def test_voice_mask_step_reports_redaction_when_pii_appears_in_later_sentence(
+    monkeypatch,
+) -> None:
+    import json
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from src.voice import router
+
+    async def synthesize_stream(text: str, usage_out: dict | None = None):
+        yield b"\x00\x01" * 40
+
+    monkeypatch.setattr(router, "synthesize_stream", synthesize_stream)
+    _install_scripted(monkeypatch, ["where is order 4"])
+
+    async def mask_text(seg: str) -> tuple[str, str]:
+        if "123 Market St" in seg:
+            return seg.replace("123 Market St", "*************"), "PII masked in the response"
+        return seg, "no PII found, response unchanged"
+
+    async def pipeline(runner, user_id, text, **kwargs):
+        s1 = "Order 4 is currently processing. "
+        s2 = "It ships to 123 Market St tomorrow."
+        yield {"type": "delta", "text": s1}
+        yield {"type": "delta", "text": s1 + s2}
+        yield {"type": "final", "blocked": False, "response": s1 + s2}
+
+    app = FastAPI()
+    app.include_router(
+        router.make_voice_router(
+            runners={"shopper": object()},
+            pipeline=pipeline,
+            mask_enabled=lambda: True,
+            mask_text=mask_text,
+        )
+    )
+    with TestClient(app) as client:
+        with client.websocket_connect("/voice/ws?user_id=shopper") as ws:
+            ws.send_bytes(b"\x00\x01" * 160)
+            ws.send_text(json.dumps({"type": "utterance_end", "commit": True}))
+            events = _events(ws, limit=50)
+
+    mask_steps = [e for e in events if e.get("type") == "step" and e.get("key") == "mask"]
+    assert len(mask_steps) == 1
+    assert mask_steps[0]["detail"] == "PII masked in the response"
+    assert mask_steps[0]["in_chars"] > len("Order 4 is currently processing.")
+
+
+def test_voice_ws_disconnect_cancels_live_reader_without_unhandled_error(monkeypatch) -> None:
+    import asyncio
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from src.voice import router
+
+    class ClosingErrorUtterance:
+        def __init__(self) -> None:
+            self._closed = False
+            self._gate = asyncio.Event()
+
+        async def open(self) -> None:
+            return None
+
+        async def send(self, pcm: bytes) -> None:
+            return None
+
+        async def updates(self):
+            await self._gate.wait()
+            raise RuntimeError("1000 None.")
+            yield ""  # pragma: no cover
+
+        async def close(self) -> None:
+            self._closed = True
+            self._gate.set()
+
+    monkeypatch.setattr(router, "open_utterance", ClosingErrorUtterance)
+
+    async def pipeline(runner, user_id, text, **kwargs):
+        yield {"type": "final", "blocked": False, "response": "ok"}
+
+    app = FastAPI()
+    app.include_router(
+        router.make_voice_router(runners={"shopper": object()}, pipeline=pipeline)
+    )
+    with TestClient(app) as client:
+        with client.websocket_connect("/voice/ws?user_id=shopper") as ws:
+            ws.send_bytes(b"\x01\x02" * 160)
+            ws.receive_text()  # stage: stt
+            # Disconnect immediately while Live session reader is open.
