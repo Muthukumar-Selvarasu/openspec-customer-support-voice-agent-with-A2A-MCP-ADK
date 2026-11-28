@@ -39,9 +39,12 @@ def _utc_now() -> str:
 
 
 class InMemoryTaskManager:
-    """Store A2A tasks in process memory."""
+    """Store A2A tasks in process memory with bounded FIFO eviction."""
 
-    def __init__(self) -> None:
+    def __init__(self, max_tasks: int = 1000) -> None:
+        if max_tasks < 1:
+            raise ValueError("max_tasks must be >= 1")
+        self.max_tasks = max_tasks
         self.tasks: dict[str, Task] = {}
         self.task_messages: dict[str, list[Message]] = {}
         self.push_notifications: dict[str, dict[str, Any]] = {}
@@ -52,6 +55,11 @@ class InMemoryTaskManager:
             task_id = params.id
             session_id = params.sessionId or str(uuid.uuid4())
             if task_id not in self.tasks:
+                while len(self.tasks) >= self.max_tasks:
+                    oldest_id = next(iter(self.tasks))
+                    self.tasks.pop(oldest_id, None)
+                    self.task_messages.pop(oldest_id, None)
+                    self.push_notifications.pop(oldest_id, None)
                 task = Task(
                     id=task_id,
                     sessionId=session_id,
@@ -140,8 +148,8 @@ def user_query(params: TaskSendParams) -> str:
 class _AgentTaskManager(InMemoryTaskManager):
     """Run one async agent call for send and sendSubscribe."""
 
-    def __init__(self, agent_call: AgentCall) -> None:
-        super().__init__()
+    def __init__(self, agent_call: AgentCall, max_tasks: int = 1000) -> None:
+        super().__init__(max_tasks=max_tasks)
         self.call_agent = agent_call
 
     async def on_send_task(self, request: SendTaskRequest) -> JSONRPCResponse:
@@ -236,10 +244,10 @@ class _AgentTaskManager(InMemoryTaskManager):
 
 
 class JudgeTaskManager(_AgentTaskManager):
-    def __init__(self, judge_agent_call: AgentCall) -> None:
-        super().__init__(agent_call=judge_agent_call)
+    def __init__(self, judge_agent_call: AgentCall, max_tasks: int = 1000) -> None:
+        super().__init__(agent_call=judge_agent_call, max_tasks=max_tasks)
 
 
 class MaskTaskManager(_AgentTaskManager):
-    def __init__(self, mask_agent_call: AgentCall) -> None:
-        super().__init__(agent_call=mask_agent_call)
+    def __init__(self, mask_agent_call: AgentCall, max_tasks: int = 1000) -> None:
+        super().__init__(agent_call=mask_agent_call, max_tasks=max_tasks)

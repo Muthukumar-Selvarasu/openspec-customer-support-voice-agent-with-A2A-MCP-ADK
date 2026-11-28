@@ -25,7 +25,7 @@ from src.a2a.utils import dump_model
 logger = logging.getLogger(__name__)
 
 
-def _rpc_error(request_id: int, code: int, message: str) -> JSONResponse:
+def _rpc_error(request_id: int | str, code: int, message: str) -> JSONResponse:
     return JSONResponse(
         {"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}}
     )
@@ -49,7 +49,7 @@ class A2AServer:
         self.app.add_middleware(
             CORSMiddleware,
             allow_origins=["*"],
-            allow_credentials=True,
+            allow_credentials=False,
             allow_methods=["*"],
             allow_headers=["*"],
         )

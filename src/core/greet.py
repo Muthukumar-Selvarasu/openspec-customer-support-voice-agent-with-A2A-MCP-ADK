@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any
 from urllib.parse import quote_plus
 
 import psycopg2
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_PGHOST = "127.0.0.1"
 DEFAULT_PGPORT = "5432"
@@ -63,7 +66,8 @@ def authenticate_user(email: str, password: str) -> dict[str, Any] | None:
             "is_premium_customer": row[3],
             "total_items_purchased": row[4],
         }
-    except Exception:
+    except Exception as exc:
+        logger.warning("Database error during authenticate_user for %s: %s", email, exc)
         return None
     finally:
         if cur is not None:

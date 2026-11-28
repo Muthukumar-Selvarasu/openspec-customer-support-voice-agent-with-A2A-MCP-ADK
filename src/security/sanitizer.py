@@ -10,7 +10,7 @@ ALLOWED_CHARS = set(
 
 MAX_INPUT_LENGTH = 300
 
-_FINAL_PATTERN = re.compile(r"^[a-zA-Z0-9\s.,!?()'-]*$")
+_FINAL_PATTERN = re.compile(r"^[a-zA-Z0-9 .,!?'-]*$")
 
 
 def sanitize_input(text: str) -> str:

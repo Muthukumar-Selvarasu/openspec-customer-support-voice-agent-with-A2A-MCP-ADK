@@ -24,6 +24,8 @@ class SecurityBlocker:
             r"DROP\s+ALL\s+TABLES",
             r"DROP\s+TABLE\s+.*CASCADE",
             r"TRUNCATE\s+TABLE\s+.*CASCADE",
+            r"\bTRUNCATE\s+TABLE\b",
+            r"\bDELETE\s+FROM\b",
             r"ALTER\s+TABLE\s+.*DROP\s+COLUMN",
             r"DROP\s+INDEX",
             r"DROP\s+TRIGGER",
@@ -47,7 +49,7 @@ class SecurityBlocker:
             r"'\s*OR\s*1\s*=\s*1",
             r"'=1\s*--",
             r"--",
-            r"#",
+            r"<!--\s*#",
             r"/\*",
             r"\*/",
             r"UNION\s+SELECT.*FROM",
@@ -102,6 +104,10 @@ class SecurityBlocker:
             r"\bsudo\b",
             r"execute.*command",
             r"ignore.*instructions",
+            r"\b(?:ignore|disregard|forget|override)\s+(?:all\s+)?(?:previous|prior|above|system|your)\s+(?:rules|instructions|prompts?|guidelines)\b",
+            r"\b(?:repeat|reveal|print|show|dump|leak|output|display)\s+(?:me\s+)?(?:your\s+|the\s+)?(?:system\s+prompt|hidden\s+instructions|initial\s+instructions|developer\s+prompt)\b",
+            r"\b(?:DAN|developer)\s+mode\b",
+            r"\[\s*SYSTEM\s*\]\s*:",
             r"harmful.*assistant",
             r"\*\*\*",
             r"rm\s+-[rf]+\s+",
@@ -247,6 +253,25 @@ class SecurityBlocker:
 
 
 _BLOCKER = SecurityBlocker()
+
+OFF_TOPIC_REDIRECT = (
+    "I can only help with customer support requests such as checking orders, "
+    "returns, cancellations, or updating your account details."
+)
+
+
+def parse_judge_verdict(verdict: str | None) -> str:
+    """Parse a closed 1-token Judge verdict fail-closed.
+
+    Returns ``"ALLOW"``, ``"OFF_TOPIC"``, or ``"BLOCKED"``.
+    Empty, ``None``, or unparseable values fail closed as ``"BLOCKED"``.
+    """
+    if not isinstance(verdict, str):
+        return "BLOCKED"
+    token = verdict.strip().strip("`*\"' \t\r\n.:;!?()[]{}").upper()
+    if token in ("ALLOW", "BLOCKED", "OFF_TOPIC"):
+        return token
+    return "BLOCKED"
 
 
 def evaluate_prompt(query: str) -> str:

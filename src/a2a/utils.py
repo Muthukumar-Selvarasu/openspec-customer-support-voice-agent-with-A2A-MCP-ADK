@@ -19,7 +19,7 @@ def are_modalities_compatible(
     return any(modality in agent_modalities for modality in client_modalities)
 
 
-def new_incompatible_types_error(request_id: int) -> JSONRPCResponse:
+def new_incompatible_types_error(request_id: int | str) -> JSONRPCResponse:
     """JSON-RPC error for an output mode the agent cannot produce."""
     return JSONRPCResponse(
         id=request_id,

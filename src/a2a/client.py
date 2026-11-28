@@ -12,6 +12,8 @@ import aiohttp
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_A2A_TIMEOUT_SECONDS = 15.0
+
 _session: aiohttp.ClientSession | None = None
 _session_loop: asyncio.AbstractEventLoop | None = None
 
@@ -21,7 +23,9 @@ def _get_session() -> aiohttp.ClientSession:
     global _session, _session_loop
     loop = asyncio.get_running_loop()
     if _session is None or _session.closed or _session_loop is not loop:
-        _session = aiohttp.ClientSession()
+        _session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=DEFAULT_A2A_TIMEOUT_SECONDS)
+        )
         _session_loop = loop
     return _session
 
@@ -59,20 +63,34 @@ def _text_from_task(task: dict[str, Any]) -> str:
     return _text_from_parts(message.get("parts") or [])
 
 
-async def call_a2a_agent(query: str, host: str, port: int, stream: bool = False) -> str:
+async def call_a2a_agent(
+    query: str,
+    host: str,
+    port: int,
+    stream: bool = False,
+    timeout: float = DEFAULT_A2A_TIMEOUT_SECONDS,
+) -> str:
     """Send ``query`` to an A2A server and return the agent's text."""
     url = f"http://{host}:{port}/rpc"
     task_id = f"task-{uuid.uuid4()}"
     session_id = f"session-{uuid.uuid4()}"
     if stream:
-        return await _call_stream(query, url, task_id, session_id)
-    return await _call_sync(query, url, task_id, session_id)
+        return await _call_stream(query, url, task_id, session_id, timeout=timeout)
+    return await _call_sync(query, url, task_id, session_id, timeout=timeout)
 
 
-async def _call_sync(query: str, url: str, task_id: str, session_id: str) -> str:
+async def _call_sync(
+    query: str,
+    url: str,
+    task_id: str,
+    session_id: str,
+    *,
+    timeout: float = DEFAULT_A2A_TIMEOUT_SECONDS,
+) -> str:
     payload = _payload("tasks/send", query, task_id, session_id)
     session = _get_session()
-    async with session.post(url, json=payload) as response:
+    req_timeout = aiohttp.ClientTimeout(total=timeout)
+    async with session.post(url, json=payload, timeout=req_timeout) as response:
         if response.status != 200:
             error_text = await response.text()
             logger.error("Error calling agent: %s", error_text)
@@ -84,11 +102,19 @@ async def _call_sync(query: str, url: str, task_id: str, session_id: str) -> str
     return _text_from_task(result.get("result") or {})
 
 
-async def _call_stream(query: str, url: str, task_id: str, session_id: str) -> str:
+async def _call_stream(
+    query: str,
+    url: str,
+    task_id: str,
+    session_id: str,
+    *,
+    timeout: float = DEFAULT_A2A_TIMEOUT_SECONDS,
+) -> str:
     payload = _payload("tasks/sendSubscribe", query, task_id, session_id)
     result_text = ""
     session = _get_session()
-    async with session.post(url, json=payload) as response:
+    req_timeout = aiohttp.ClientTimeout(total=timeout)
+    async with session.post(url, json=payload, timeout=req_timeout) as response:
         if response.status != 200:
             error_text = await response.text()
             logger.error("Error calling agent: %s", error_text)

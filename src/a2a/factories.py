@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 from src.a2a.server import A2AServer
 from src.a2a.task_manager import AgentCall, JudgeTaskManager, MaskTaskManager
 from src.a2a.types import AgentCapabilities, AgentCard, AgentSkill
@@ -11,6 +13,17 @@ _CAPABILITIES = AgentCapabilities(
     pushNotifications=False,
     stateTransitionHistory=True,
 )
+
+
+def _advertised_host(host: str) -> str:
+    """Resolve a routable hostname for discovery cards when bound to ``0.0.0.0``."""
+    if host != "0.0.0.0":
+        return host
+    for env_name in ("A2A_PUBLIC_HOST", "RAILWAY_PRIVATE_DOMAIN"):
+        value = os.getenv(env_name, "").strip()
+        if value:
+            return value
+    return "localhost"
 
 
 def _card(
@@ -24,7 +37,7 @@ def _card(
     return AgentCard(
         name=name,
         description=description,
-        url=f"http://{host}:{port}/",
+        url=f"http://{_advertised_host(host)}:{port}/",
         version="1.0.0",
         defaultInputModes=["text", "text/plain"],
         defaultOutputModes=["text", "text/plain"],

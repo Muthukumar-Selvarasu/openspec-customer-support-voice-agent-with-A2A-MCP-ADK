@@ -168,7 +168,90 @@ def test_tenant_callback_is_attached_to_support_agent(monkeypatch: pytest.Monkey
     web._build_runner("alice.jones@example.com")
     assert captured["before_tool_callback"] is web._enforce_tenant_tool_callback
     assert "alice.jones@example.com" in captured["instruction"]
-    assert captured["tools"][-1] is web.search_memory
+    mem_tool = captured["tools"][-1]
+    assert mem_tool.__name__ == "search_memory"
+    import inspect
+
+    assert list(inspect.signature(mem_tool).parameters.keys()) == ["query"]
+
+
+def test_tenant_callback_fails_closed_when_session_identity_missing() -> None:
+    import src.api.web as web
+
+    tool = _FakeTool("get-order-status")
+    args = {"order_id": 4, "customer_email": "bob.smith@techmail.com"}
+    result = web._enforce_tenant_tool_callback(tool, args, _FakeToolContext(""))
+    assert isinstance(result, dict) and "error" in result
+    assert "identity" in result["error"].lower()
+
+    result_none = web._enforce_tenant_tool_callback(tool, args, SimpleNamespace(session=None))
+    assert isinstance(result_none, dict) and "error" in result_none
+
+
+def test_tenant_callback_injects_omitted_identity_args_for_all_tools() -> None:
+    import src.api.web as web
+
+    ctx = _FakeToolContext("alice.jones@example.com")
+
+    order_args: dict = {"order_id": 4}
+    assert web._enforce_tenant_tool_callback(_FakeTool("get-order-status"), order_args, ctx) is None
+    assert order_args["customer_email"] == "alice.jones@example.com"
+
+    history_args: dict = {}
+    assert web._enforce_tenant_tool_callback(_FakeTool("find-customer-orders"), history_args, ctx) is None
+    assert history_args["email"] == "alice.jones@example.com"
+
+    mem_args: dict = {"query": "preferences"}
+    assert web._enforce_tenant_tool_callback(_FakeTool("search_memory"), mem_args, ctx) is None
+    assert mem_args["user_id"] == "alice.jones@example.com"
+
+    log_args: dict = {
+        "action_type": "cancel_order",
+        "parameters": '{"order_id": 4, "reason": "changed mind"}',
+    }
+    assert web._enforce_tenant_tool_callback(_FakeTool("action-log"), log_args, ctx) is None
+    assert log_args["user_email"] == "alice.jones@example.com"
+    assert log_args["action_type"] == "CANCEL_ORDER"
+
+
+def test_tenant_callback_enforces_action_log_allowlist_and_json_parameters() -> None:
+    import src.api.web as web
+
+    ctx = _FakeToolContext("alice.jones@example.com")
+    tool = _FakeTool("action-log")
+
+    # Disallowed action types rejected
+    for bad_type in ("ISSUE_REFUND", "GRANT_DISCOUNT", "DROP_TABLE", ""):
+        res = web._enforce_tenant_tool_callback(
+            tool,
+            {"action_type": bad_type, "parameters": '{"order_id": 4}'},
+            ctx,
+        )
+        assert isinstance(res, dict) and "error" in res, bad_type
+
+    # Invalid / non-object JSON parameters rejected
+    for bad_params in ("not-json", "[1, 2, 3]", "123", None, ""):
+        res = web._enforce_tenant_tool_callback(
+            tool,
+            {"action_type": "RETURN_ITEM", "parameters": bad_params},
+            ctx,
+        )
+        assert isinstance(res, dict) and "error" in res, bad_params
+
+    # All 8 allowlisted action types with valid JSON object succeed
+    for ok_type in (
+        "UPDATE_ORDER_STATUS",
+        "RETURN_ITEM",
+        "UPDATE_DELIVERY_ADDRESS",
+        "UPDATE_PROFILE_DETAILS",
+        "CANCEL_ORDER",
+        "RETURN_ORDER",
+        "UPDATE_ADDRESS",
+        "UPDATE_PROFILE",
+    ):
+        args = {"action_type": ok_type, "parameters": '{"order_id": 4}'}
+        assert web._enforce_tenant_tool_callback(tool, args, ctx) is None, ok_type
+        assert args["user_email"] == "alice.jones@example.com"
 
 
 def test_pages_served_from_src_static_and_voice_mounted() -> None:
@@ -291,8 +374,12 @@ def _order_events(user_id: str, web) -> list:
 
 
 async def _echo_a2a(query: str, host: str, port: int, stream: bool = False) -> str:
+    import src.api.web as web
+
     if "DROP TABLE" in query.upper():
         return "BLOCKED"
+    if port == web.resolve_service_settings().judge_port:
+        return "ALLOW"
     return query
 
 
@@ -417,7 +504,7 @@ async def test_cli_validate_input_is_what_runner_receives(monkeypatch: pytest.Mo
     async def fake_a2a(query: str, host: str, port: int, stream: bool = False) -> str:
         if port == settings.mask_port:
             return "Hello Alice Jones"
-        return query
+        return "ALLOW"
 
     monkeypatch.setattr(cli, "call_a2a_agent", fake_a2a)
     raw = "Status of order #5?"

@@ -71,13 +71,15 @@ def test_bind_servers_store_env_host_and_port(monkeypatch) -> None:
     monkeypatch.setenv("A2A_JUDGE_PORT", "18002")
     monkeypatch.setenv("A2A_MASK_HOST", "0.0.0.0")
     monkeypatch.setenv("A2A_MASK_PORT", "18003")
+    monkeypatch.delenv("A2A_PUBLIC_HOST", raising=False)
+    monkeypatch.delenv("RAILWAY_PRIVATE_DOMAIN", raising=False)
     judge_host, judge_port, mask_host, mask_port = resolve_server_binds()
     judge = create_judge_server(host=judge_host, port=judge_port, call_judge_agent=_echo)
     mask = create_mask_server(host=mask_host, port=mask_port, call_mask_agent=_echo)
     assert (judge.host, judge.port) == ("0.0.0.0", 18002)
     assert (mask.host, mask.port) == ("0.0.0.0", 18003)
-    assert judge.agent_card.url == "http://0.0.0.0:18002/"
-    assert mask.agent_card.url == "http://0.0.0.0:18003/"
+    assert judge.agent_card.url == "http://localhost:18002/"
+    assert mask.agent_card.url == "http://localhost:18003/"
     assert judge.agent_card.name == "security-judge"
 
 
@@ -129,13 +131,13 @@ async def test_mask_agent_redacts_email_locally() -> None:
     assert "*" in masked
 
 
-def test_mask_pipeline_orders_judge_before_masker() -> None:
-    from src.agents.pipeline import security_pipeline
+def test_dead_mask_llm_agent_and_pipeline_are_removed() -> None:
+    import src.agents.mask_agent as mask_mod
 
-    assert [agent.name for agent in security_pipeline.sub_agents] == [
-        "security_judge",
-        "data_masker",
-    ]
+    assert not hasattr(mask_mod, "mask_agent")
+    assert "LlmAgent" not in _MASK_AGENT_SOURCE
+    pipeline_path = Path(__file__).resolve().parents[2] / "src" / "agents" / "pipeline.py"
+    assert not pipeline_path.exists()
 
 
 def test_mask_rpc_send_redacts_email() -> None:
@@ -377,3 +379,150 @@ async def test_live_judge_gemini() -> None:
     result = await call_judge_agent("Where is order 3?")
     assert isinstance(result, str)
     assert result.strip()
+
+
+def test_single_role_serve_one_falls_back_when_port_unset(monkeypatch) -> None:
+    import src.a2a.run_servers as run_mod
+
+    for key in ("HOST", "PORT", "A2A_JUDGE_PORT", "A2A_MASK_PORT"):
+        monkeypatch.delenv(key, raising=False)
+
+    assert run_mod.resolve_single_role_bind("judge") == ("0.0.0.0", 10002)
+    assert run_mod.resolve_single_role_bind("masker") == ("0.0.0.0", 10003)
+
+    monkeypatch.setenv("A2A_JUDGE_PORT", "11002")
+    monkeypatch.setenv("A2A_MASK_PORT", "11003")
+    monkeypatch.setenv("HOST", "127.0.0.1")
+    assert run_mod.resolve_single_role_bind("judge") == ("127.0.0.1", 11002)
+    assert run_mod.resolve_single_role_bind("masker") == ("127.0.0.1", 11003)
+
+    monkeypatch.setenv("PORT", "9090")
+    assert run_mod.resolve_single_role_bind("judge") == ("127.0.0.1", 9090)
+
+    started = []
+    monkeypatch.setattr(run_mod, "_run_server", started.append)
+    monkeypatch.delenv("PORT", raising=False)
+    run_mod.serve_one("judge")
+    assert len(started) == 1
+    assert (started[0].host, started[0].port) == ("127.0.0.1", 11002)
+
+
+def test_wildcard_bind_advertises_routable_host_in_agent_card(monkeypatch) -> None:
+    from fastapi.testclient import TestClient
+
+    monkeypatch.delenv("A2A_PUBLIC_HOST", raising=False)
+    monkeypatch.setenv("RAILWAY_PRIVATE_DOMAIN", "a2a-judge.railway.internal")
+    server = create_judge_server(host="0.0.0.0", port=10002, call_judge_agent=_echo)
+    card = TestClient(server.app).get("/.well-known/agent.json").json()
+    assert card["url"] == "http://a2a-judge.railway.internal:10002/"
+
+    monkeypatch.setenv("A2A_PUBLIC_HOST", "judge.custom.local")
+    server2 = create_judge_server(host="0.0.0.0", port=10002, call_judge_agent=_echo)
+    card2 = TestClient(server2.app).get("/.well-known/agent.json").json()
+    assert card2["url"] == "http://judge.custom.local:10002/"
+
+    monkeypatch.delenv("A2A_PUBLIC_HOST", raising=False)
+    monkeypatch.delenv("RAILWAY_PRIVATE_DOMAIN", raising=False)
+    server3 = create_judge_server(host="0.0.0.0", port=10002, call_judge_agent=_echo)
+    card3 = TestClient(server3.app).get("/.well-known/agent.json").json()
+    assert card3["url"] == "http://localhost:10002/"
+
+
+def test_a2a_server_cors_sets_allow_credentials_false() -> None:
+    from fastapi.middleware.cors import CORSMiddleware
+
+    server = create_judge_server(call_judge_agent=_echo)
+    cors = [m for m in server.app.user_middleware if m.cls is CORSMiddleware]
+    assert len(cors) == 1
+    assert cors[0].kwargs.get("allow_credentials") is False
+
+
+async def test_in_memory_task_manager_evicts_fifo_at_capacity() -> None:
+    from src.a2a.task_manager import InMemoryTaskManager
+    from src.a2a.types import Message, TaskSendParams, TextPart
+
+    default_mgr = InMemoryTaskManager()
+    assert default_mgr.max_tasks == 1000
+
+    mgr = InMemoryTaskManager(max_tasks=3)
+    for i in range(5):
+        tid = f"t-{i}"
+        await mgr.upsert_task(
+            TaskSendParams(
+                id=tid,
+                message=Message(role="user", parts=[TextPart(text=f"msg-{i}")]),
+            )
+        )
+        await mgr.set_push_notification(tid, {"url": f"https://hook.example/{i}"})
+
+    assert list(mgr.tasks.keys()) == ["t-2", "t-3", "t-4"]
+    assert list(mgr.task_messages.keys()) == ["t-2", "t-3", "t-4"]
+    assert "t-0" not in mgr.push_notifications
+    assert "t-1" not in mgr.push_notifications
+    assert await mgr.get_task("t-0") is None
+    assert await mgr.get_task("t-4") is not None
+
+
+def test_jsonrpc_accepts_string_ids_and_push_notification_methods(monkeypatch) -> None:
+    from fastapi.testclient import TestClient
+
+    _patch_agents(monkeypatch)
+    import src.agents.judge_agent as judge_mod
+
+    client = TestClient(
+        create_judge_server(call_judge_agent=judge_mod.call_judge_agent).app
+    )
+    req_id = "req-abc-123"
+    sent = client.post(
+        "/rpc",
+        json={
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "method": "tasks/send",
+            "params": _user_message("where is order 3?", "task-str-id"),
+        },
+    )
+    assert sent.status_code == 200
+    assert sent.json()["id"] == req_id
+    assert sent.json()["result"]["id"] == "task-str-id"
+
+    fetched = client.post(
+        "/rpc",
+        json={
+            "jsonrpc": "2.0",
+            "id": "get-1",
+            "method": "tasks/get",
+            "params": {"id": "task-str-id"},
+        },
+    )
+    assert fetched.status_code == 200
+    assert fetched.json()["id"] == "get-1"
+
+    set_push = client.post(
+        "/rpc",
+        json={
+            "jsonrpc": "2.0",
+            "id": "push-set-1",
+            "method": "tasks/pushNotification/set",
+            "params": {
+                "id": "task-str-id",
+                "pushNotificationConfig": {"url": "https://example.com/hook"},
+            },
+        },
+    )
+    assert set_push.status_code == 200
+    assert set_push.json()["id"] == "push-set-1"
+    assert set_push.json()["result"]["pushNotificationConfig"]["url"] == "https://example.com/hook"
+
+    get_push = client.post(
+        "/rpc",
+        json={
+            "jsonrpc": "2.0",
+            "id": "push-get-1",
+            "method": "tasks/pushNotification/get",
+            "params": {"id": "task-str-id"},
+        },
+    )
+    assert get_push.status_code == 200
+    assert get_push.json()["id"] == "push-get-1"
+    assert get_push.json()["result"]["pushNotificationConfig"]["url"] == "https://example.com/hook"

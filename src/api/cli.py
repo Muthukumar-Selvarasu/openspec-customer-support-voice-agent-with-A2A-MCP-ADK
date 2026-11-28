@@ -27,9 +27,11 @@ from src.api.web import (
     resolve_service_settings,
 )
 from src.core.greet import authenticate_user, get_user_actions, resolve_postgres_dsn
-from src.core.memory import save_memory, search_memory
+from src.core.memory import make_memory_search_tool, save_memory, search_memory
 from src.core.prompts import SQL_PROMPT_INSTRUCTION
 from src.core.telemetry import ATTR, get_tracer
+from src.security.blocker import OFF_TOPIC_REDIRECT, evaluate_prompt, parse_judge_verdict
+from src.security.masker import mask_sensitive_data
 from src.security.sanitizer import sanitize_input
 
 logger = logging.getLogger(__name__)
@@ -92,12 +94,17 @@ async def validate_input(user_input: str) -> str | None:
                 print("Please rephrase your question.\n")
                 span.set_attribute(ATTR.OUTPUT_VALUE, "blocked")
                 return None
+        if evaluate_prompt(user_input) == "BLOCKED" or evaluate_prompt(clean) == "BLOCKED":
+            span.set_attribute(ATTR.OUTPUT_VALUE, "blocked")
+            print("\nSecurity Alert: Your input was flagged by the local SecurityBlocker.")
+            print("Please rephrase your question in a safe manner.\n")
+            return None
         with tracer.start_as_current_span("security.a2a_judge") as judge_span:
             judge_span.set_attribute(ATTR.OPENINFERENCE_SPAN_KIND, "GUARDRAIL")
-            judge_span.set_attribute(ATTR.INPUT_VALUE, clean)
+            judge_span.set_attribute(ATTR.INPUT_VALUE, user_input[:500])
             try:
                 verdict = await call_a2a_agent(
-                    query=clean,
+                    query=user_input,
                     host=settings.judge_host,
                     port=settings.judge_port,
                 )
@@ -108,9 +115,13 @@ async def validate_input(user_input: str) -> str | None:
                 print("Ensure A2A servers are running: python -m src.a2a.run_servers\n")
                 span.set_attribute(ATTR.OUTPUT_VALUE, "blocked")
                 return None
-            verdict = verdict or ""
-            judge_span.set_attribute(ATTR.OUTPUT_VALUE, verdict[:200])
-            if "BLOCKED" in verdict.upper():
+            decision = parse_judge_verdict(verdict)
+            judge_span.set_attribute(ATTR.OUTPUT_VALUE, decision)
+            if decision == "OFF_TOPIC":
+                span.set_attribute(ATTR.OUTPUT_VALUE, "off_topic")
+                print(f"\nAgent: {OFF_TOPIC_REDIRECT}\n")
+                return None
+            if decision != "ALLOW":
                 span.set_attribute(ATTR.OUTPUT_VALUE, "blocked")
                 print("\nSecurity Alert: Your input was flagged by the Security Judge agent.")
                 print("Please rephrase your question in a safe manner.\n")
@@ -133,12 +144,14 @@ async def _mask_response(text: str) -> str:
                 port=settings.mask_port,
             )
         except Exception as exc:
-            span.set_attribute(ATTR.OUTPUT_VALUE, f"mask_skipped: {exc}")
-            logger.warning("Mask A2A agent unreachable, returning raw text: %s", exc)
-            return text
+            local_masked = mask_sensitive_data(text)
+            span.set_attribute(ATTR.OUTPUT_VALUE, f"local_fallback: {exc}")
+            logger.warning("Mask A2A agent unreachable, using local masker fallback: %s", exc)
+            return local_masked
         if not masked:
-            span.set_attribute(ATTR.OUTPUT_VALUE, text[:500])
-            return text
+            local_masked = mask_sensitive_data(text)
+            span.set_attribute(ATTR.OUTPUT_VALUE, local_masked[:500])
+            return local_masked
         span.set_attribute(ATTR.OUTPUT_VALUE, masked[:500])
         return masked
 
@@ -291,7 +304,7 @@ async def main() -> None:
         name="customer_support_assistant",
         description="Customer support agent for order questions and requests.",
         instruction=SQL_PROMPT_INSTRUCTION.format(USER_ID=user_id),
-        tools=[*get_database_tools(), search_memory],
+        tools=[*get_database_tools(), make_memory_search_tool(user_id)],
         before_tool_callback=_enforce_tenant_tool_callback,
     )
     session_service = InMemorySessionService()

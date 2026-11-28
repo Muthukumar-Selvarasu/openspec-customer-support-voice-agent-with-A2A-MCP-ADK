@@ -165,14 +165,14 @@ class TaskError(JsonRpcError):
 
 class JSONRPCResponse(BaseModel):
     jsonrpc: str = "2.0"
-    id: int
+    id: int | str
     result: Any | None = None
     error: JsonRpcError | None = None
 
 
 class SendTaskRequest(BaseModel):
     jsonrpc: str = "2.0"
-    id: int
+    id: int | str
     method: str = "tasks/send"
     params: TaskSendParams
 
@@ -183,7 +183,7 @@ class SendTaskResponse(JSONRPCResponse):
 
 class SendTaskStreamingRequest(BaseModel):
     jsonrpc: str = "2.0"
-    id: int
+    id: int | str
     method: str = "tasks/sendSubscribe"
     params: TaskSendParams
 
@@ -194,7 +194,7 @@ class SendTaskStreamingResponse(JSONRPCResponse):
 
 class GetTaskRequest(BaseModel):
     jsonrpc: str = "2.0"
-    id: int
+    id: int | str
     method: str = "tasks/get"
     params: dict[str, Any]
 

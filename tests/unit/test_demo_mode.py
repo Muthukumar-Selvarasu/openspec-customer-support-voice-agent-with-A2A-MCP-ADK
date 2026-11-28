@@ -483,30 +483,33 @@ def test_guardrails_toggles_override_judge_and_mask_in_both_explain_and_quick(we
 
 
 async def test_parallel_judge_and_agent_cancels_agent_on_block(web, monkeypatch) -> None:
-    import asyncio
+    """Strict pre-agent gating: Judge must complete before runner.run_async starts."""
+    timeline: list[str] = []
 
-    agent_started = asyncio.Event()
+    class _GatedRunner:
+        def __init__(self) -> None:
+            self.calls = 0
 
-    class _ConcurrentRunner:
         async def run_async(self, **kwargs):
-            agent_started.set()
-            await asyncio.sleep(0.05)
+            self.calls += 1
+            timeline.append("agent_start")
             yield _FinalEvent()
 
     async def judge_pass(text: str) -> tuple[bool, str]:
-        # Wait until _ConcurrentRunner starts in parallel before returning!
-        await asyncio.wait_for(agent_started.wait(), timeout=1.0)
-        return True, text
+        timeline.append("judge_start")
+        timeline.append("judge_end")
+        return True, "ALLOW"
 
     async def judge_block(text: str) -> tuple[bool, str]:
-        await asyncio.wait_for(agent_started.wait(), timeout=1.0)
+        timeline.append("judge_block")
         return False, "BLOCKED"
 
+    runner_pass = _GatedRunner()
     monkeypatch.setattr(web, "_judge", judge_pass)
     passed_events = [
         ev
         async for ev in web.text_pipeline(
-            _ConcurrentRunner(),
+            runner_pass,
             USER,
             "Where is order 4?",
             judge=True,
@@ -515,13 +518,16 @@ async def test_parallel_judge_and_agent_cancels_agent_on_block(web, monkeypatch)
         )
     ]
     assert passed_events[-1] == {"type": "final", "blocked": False, "response": ANSWER}
+    assert runner_pass.calls == 1
+    assert timeline == ["judge_start", "judge_end", "agent_start"]
 
-    agent_started.clear()
+    timeline.clear()
+    runner_block = _GatedRunner()
     monkeypatch.setattr(web, "_judge", judge_block)
     blocked_events = [
         ev
         async for ev in web.text_pipeline(
-            _ConcurrentRunner(),
+            runner_block,
             USER,
             "Where is order 4?",
             judge=True,
@@ -532,6 +538,8 @@ async def test_parallel_judge_and_agent_cancels_agent_on_block(web, monkeypatch)
     assert blocked_events[-1]["type"] == "final"
     assert blocked_events[-1]["blocked"] is True
     assert blocked_events[-1]["stage"] == "judge"
+    assert runner_block.calls == 0
+    assert timeline == ["judge_block"]
     assert not any(ev["type"] in ("llm", "delta") for ev in blocked_events)
 
 

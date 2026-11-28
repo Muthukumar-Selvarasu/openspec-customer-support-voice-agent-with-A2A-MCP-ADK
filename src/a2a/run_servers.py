@@ -112,22 +112,38 @@ def selected_role() -> str | None:
     return None
 
 
+def resolve_single_role_bind(role: str) -> tuple[str, int]:
+    """Resolve bind ``(host, port)`` for ``A2A_ONLY=judge|masker``.
+
+    Reads ``HOST`` (default ``0.0.0.0``) and ``PORT``, falling back to
+    ``A2A_JUDGE_PORT`` / ``A2A_MASK_PORT`` (and their defaults) when ``PORT``
+    is unset or blank.
+    """
+    host = _env_text("HOST", "0.0.0.0")
+    if role == "judge":
+        default_port = _env_port("A2A_JUDGE_PORT", DEFAULT_JUDGE_PORT)
+    else:
+        default_port = _env_port("A2A_MASK_PORT", DEFAULT_MASK_PORT)
+    port = _env_port("PORT", default_port)
+    return host, port
+
+
 def serve_one(role: str) -> None:
-    """Bind one A2A server to ``0.0.0.0:$PORT`` and block."""
+    """Bind one A2A server to ``$HOST:$PORT`` (with role port fallback) and block."""
     from src.agents.judge_agent import call_judge_agent
     from src.agents.mask_agent import call_mask_agent
     from src.a2a.factories import create_judge_server, create_mask_server
 
-    port = int(os.environ["PORT"])
+    host, port = resolve_single_role_bind(role)
     if role == "judge":
         server = create_judge_server(
-            host="0.0.0.0",
+            host=host,
             port=port,
             call_judge_agent=call_judge_agent,
         )
     else:
         server = create_mask_server(
-            host="0.0.0.0",
+            host=host,
             port=port,
             call_mask_agent=call_mask_agent,
         )
