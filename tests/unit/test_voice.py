@@ -227,14 +227,14 @@ def test_live_session_flush_waits_for_final_after_interim_and_caps_empty_drain(m
         assert text == "where is order 5"
         assert nbytes == 32
 
-        # Empty flush with audio bytes drains within ~250 ms (well under 0.6 s).
-        await utter.send(b"\x00\x00" * 16)
+        # Empty flush with >= 3200 audio bytes still drains strictly within ~250 ms (under 0.35 s).
+        await utter.send(b"\x00\x00" * 3200)
         t1 = time.perf_counter()
         quiet_text, _u, quiet_bytes = await utter.flush(reader)
         elapsed = time.perf_counter() - t1
         assert quiet_text == ""
-        assert quiet_bytes == 32
-        assert elapsed < 0.6
+        assert quiet_bytes == 6400
+        assert elapsed < 0.35
         await utter.close()
         reader.cancel()
 
@@ -290,6 +290,22 @@ def test_take_complete_splits_on_clause_and_newline_headers() -> None:
     assert short_head == ""
     assert short_tail == "Order: 5"
 
+    # With mask=True, comma-newline addresses stay together while ':' and non-comma '\n' still split.
+    addr = "Ship to 123 Market Street,\nSpringfield, IL 62704"
+    m_head, m_tail = _take_complete(addr, mask=True)
+    assert m_head == ""
+    assert m_tail == addr
+    colon_head, colon_tail = _take_complete(
+        "Here are your recent orders:\n- Order 5 is processing", mask=True
+    )
+    assert colon_head.strip() == "Here are your recent orders:"
+    assert colon_tail == "- Order 5 is processing"
+    nl_head, nl_tail = _take_complete(
+        "Order 5 is currently processing\nOrder 6 has shipped", mask=True
+    )
+    assert nl_head.strip() == "Order 5 is currently processing"
+    assert nl_tail == "Order 6 has shipped"
+
 
 def test_cost_usd_is_non_negative() -> None:
     quiet = usd("tts", 0, 0)
@@ -329,8 +345,10 @@ def test_tts_and_stt_defaults_are_the_cascade_models() -> None:
     root = Path(__file__).resolve().parents[2]
     stt = (root / "src" / "voice" / "stt.py").read_text(encoding="utf-8")
     tts = (root / "src" / "voice" / "tts.py").read_text(encoding="utf-8")
-    assert 'VOICE_STT_MODEL", "gemini-3.1-flash-lite"' in stt
+    assert 'VOICE_STT_LIVE_MODEL", "gemini-3.1-flash-live-preview"' in stt
+    assert "async def transcribe(" not in stt
     assert 'VOICE_TTS_MODEL", "gemini-3.8-flash-tts"' in tts
+    assert "async def synthesize(" not in tts
 
 
 def test_stream_enabled_is_off_when_mask_wins(monkeypatch) -> None:
@@ -1244,13 +1262,16 @@ def test_mute_unmute_and_mic_click_off() -> None:
     root = Path(__file__).resolve().parents[2]
     source = (root / "src" / "voice" / "ui.js").read_text(encoding="utf-8")
     html = (root / "src" / "static" / "index.html").read_text(encoding="utf-8")
-    assert 'holdBtn.textContent = "Mute";' in source
-    assert 'holdBtn.textContent = "Unmute";' in source
-    assert 'holdBtn.style.display = "inline-block"' not in source
+    assert "holdBtn" not in source
+    assert "toggleHold" not in source
+    assert 'id = "hold"' not in source
     assert "Click and hold the Mic button" in source
     assert "Click and hold the Mic button" in html
-    start = source.index("function toggleHold(")
-    end = source.index("window.addEventListener(\"keydown\"", start)
+
+    status_start = source.index("function setVoiceStatus(")
+    status_end = source.index("function now(", status_start)
+    mic_start = source.index("function onMicPressStart(")
+    mic_end = source.index("window.addEventListener(\"keydown\"", mic_start)
     script = "\n".join(
         [
             "var USER = 'alice.jones@example.com';",
@@ -1260,6 +1281,7 @@ def test_mute_unmute_and_mic_click_off() -> None:
             "let pttDownAt = 0;",
             "let pttReleased = false;",
             "let pttPaused = true;",
+            "let pttTailTimer = null;",
             "let micPressHeld = false;",
             "let tabHeld = false;",
             "let startingVoice = null;",
@@ -1272,25 +1294,38 @@ def test_mute_unmute_and_mic_click_off() -> None:
             "let onsetCount = 0;",
             "let beganCount = 0;",
             "let committedCount = 0;",
-            "const holdBtn = { textContent: 'Mute', title: '', style: { display: 'none' }, classList: { add() {}, remove() {} } };",
-            "const micBtn = {};",
-            "const window = { addEventListener() {} };",
+            "const classes = new Set();",
+            "const status = { textContent: '' };",
+            "const micBtn = { classList: { toggle(k, on) { if (on) classes.add(k); else classes.delete(k); } } };",
+            "const window = { csVoiceOn: false, addEventListener() {} };",
             "function now() { return 1000; }",
-            "function setVoiceStatus() {}",
-            "function beginPtt() { beganCount += 1; pttPaused = false; pttActive = true; speaking = true; turnRunning = false; }",
-            "function releasePtt() { pttActive = false; speaking = false; pttPaused = true; pttReleased = true; committedCount += 1; }",
+            source[status_start:status_end],
+            "function beginPtt() { beganCount += 1; pttPaused = false; pttActive = true; speaking = true; turnRunning = false; setVoiceStatus('listening…'); }",
+            "function releasePtt() { pttActive = false; speaking = false; pttPaused = true; pttReleased = true; committedCount += 1; setVoiceStatus(''); }",
             "function endUtterance(commit) { speaking = false; if (commit) committedCount += 1; }",
             "function stopVoice() { voiceOn = false; }",
-            "function startVoice() { return Promise.resolve(); }",
-            source[start:end],
-            "// 1. Press mic down while agent is running -> interrupts and starts listening while held",
+            "let resolveStart = null;",
+            "function startVoice() { return new Promise((resolve) => { resolveStart = () => { voiceOn = true; pttPaused = true; resolve(); }; }); }",
+            source[mic_start:mic_end],
+            "// 1. Press mic down while agent is running -> interrupts, .on active, .live off",
             "micBtn.onmousedown();",
-            "const whileHeld = { beganCount, speaking, pttPaused, pttActive, holdDisplay: holdBtn.style.display };",
-            "// 2. Release mic button (even immediately) -> turns mic off and commits utterance",
+            "const whileHeld = { beganCount, speaking, pttPaused, pttActive, on: classes.has('on'), live: classes.has('live') };",
+            "// 2. Release mic button -> turns mic off and commits utterance",
             "micBtn.onmouseup();",
             "micBtn.onclick();",
-            "const afterRelease = { speaking, pttPaused, pttActive, committedCount, holdDisplay: holdBtn.style.display };",
-            "console.log(JSON.stringify({ whileHeld, afterRelease }));",
+            "const afterRelease = { speaking, pttPaused, pttActive, committedCount, on: classes.has('on'), live: classes.has('live') };",
+            "// 3. Non-PTT listening -> .live active, .on off",
+            "pttPaused = false; pttActive = false; pttTailTimer = null; setVoiceStatus('listening…');",
+            "const nonPttLive = { on: classes.has('on'), live: classes.has('live') };",
+            "// 4. Quick click released before startVoice() resolves -> aborts cleanly without beginPtt/releasePtt",
+            "voiceOn = false; beganCount = 0; committedCount = 0; pttPaused = false; pttActive = false;",
+            "micBtn.onmousedown();",
+            "micBtn.onmouseup();",
+            "resolveStart();",
+            "Promise.resolve().then(() => {",
+            "  const quickClick = { beganCount, committedCount, pttPaused, pttActive, speaking, csVoiceOn: window.csVoiceOn };",
+            "  console.log(JSON.stringify({ whileHeld, afterRelease, nonPttLive, quickClick }));",
+            "});",
         ]
     )
     proc = subprocess.run(["node", "-"], input=script, text=True, capture_output=True, check=False)
@@ -1301,15 +1336,151 @@ def test_mute_unmute_and_mic_click_off() -> None:
         "speaking": True,
         "pttPaused": False,
         "pttActive": True,
-        "holdDisplay": "none",
+        "on": True,
+        "live": False,
     }
     assert result["afterRelease"] == {
         "speaking": False,
         "pttPaused": True,
         "pttActive": False,
         "committedCount": 1,
-        "holdDisplay": "none",
+        "on": False,
+        "live": False,
     }
+    assert result["nonPttLive"] == {"on": False, "live": True}
+    assert result["quickClick"] == {
+        "beganCount": 0,
+        "committedCount": 0,
+        "pttPaused": True,
+        "pttActive": False,
+        "speaking": False,
+        "csVoiceOn": False,
+    }
+
+
+def test_non_ptt_vad_silence_sends_utterance_end_without_commit() -> None:
+    import json
+    import subprocess
+    from pathlib import Path
+
+    source = (Path(__file__).resolve().parents[2] / "src" / "voice" / "ui.js").read_text(
+        encoding="utf-8"
+    )
+    start = source.index("function floatToPcm(")
+    end = source.index("async function startCapture(", start)
+    script = "\n".join(
+        [
+            "const VAD_RMS = 0.02;",
+            "const BARGE_RMS = 0.12;",
+            "const BARGE_FRAMES = 3;",
+            "const ONSET_FRAMES = 2;",
+            "const END_SILENCE_MS = 1500;",
+            "const PLAYBACK_GRACE_MS = 400;",
+            "const PREROLL_FRAMES = 3;",
+            "const CAPTURE_RATE = 16000;",
+            "let speaking = false;",
+            "let voiceOn = true;",
+            "let pttActive = false;",
+            "let pttPaused = false;",
+            "let pttTailTimer = null;",
+            "let agentSpeaking = false;",
+            "let muted = false;",
+            "let frames = [];",
+            "let preroll = [];",
+            "let silentFrames = 0;",
+            "let onsetCount = 0;",
+            "let lastPlayStart = 0;",
+            "const captureCtx = { sampleRate: 16000 };",
+            "const sent = [];",
+            "const ws = { readyState: 1, send(payload) { sent.push(payload); } };",
+            "function now() { return 1000; }",
+            "function setVoiceStatus() {}",
+            "function stopPlayback() {}",
+            source[start:end],
+            "const loud = new Float32Array(1600).fill(0.3);",
+            "onFrame(loud); onFrame(loud); onFrame(loud);",
+            "const quiet = new Float32Array(1600).fill(0.0);",
+            "for (let i = 0; i < 16; i++) onFrame(quiet);",
+            "const textSent = sent.filter((x) => typeof x === 'string').map((x) => JSON.parse(x));",
+            "console.log(JSON.stringify({ textSent, pttPaused, speaking }));",
+        ]
+    )
+    proc = subprocess.run(["node", "-"], input=script, text=True, capture_output=True, check=False)
+    assert proc.returncode == 0, proc.stderr
+    result = json.loads(proc.stdout)
+    assert result["textSent"] == [{"type": "utterance_end"}]
+    assert result["pttPaused"] is False
+    assert result["speaking"] is False
+
+
+def test_voice_ui_renders_timing_and_cost_in_explain_and_hides_in_quick() -> None:
+    import json
+    import subprocess
+    from pathlib import Path
+
+    source = (Path(__file__).resolve().parents[2] / "src" / "voice" / "ui.js").read_text(
+        encoding="utf-8"
+    )
+    start = source.index("function renderVoiceMetrics(")
+    end = source.index("function ensureUserBubble(", start)
+    msg_start = source.index("function onMessage(")
+    msg_end = source.index("async function startVoice(", msg_start)
+    script = "\n".join(
+        [
+            "let mode = 'explain';",
+            "function demoMode() { return mode; }",
+            "let node = null;",
+            "let userBubble = null;",
+            "let turnRunning = false;",
+            "let ignoreAudio = false;",
+            "let voiceOn = true;",
+            "let pttActive = false;",
+            "let pttPaused = false;",
+            "let speaking = false;",
+            "let agentSpeaking = false;",
+            "const rows = [];",
+            "const pill = { textContent: '0' };",
+            "const panel = {",
+            "  querySelector(sel) {",
+            "    if (sel === '.pill') return pill;",
+            "    if (sel === '.step[data-key=\"metrics\"]') return rows.find(r => r.key === 'metrics') || null;",
+            "    return null;",
+            "  },",
+            "  querySelectorAll() { return rows; },",
+            "  appendChild(row) { rows.push(row); },",
+            "};",
+            "function stepsPanel() { return panel; }",
+            "function ensureNode() { node = node || {}; return node; }",
+            "function el(html) { return { key: 'metrics', innerHTML: html }; }",
+            "function esc(v) { return String(v); }",
+            "function scroll() {}",
+            "function setStatus() {}",
+            "function setVoiceStatus() {}",
+            "function renderEvent() {}",
+            "function onTurnEnd() {}",
+            source[start:end],
+            source[msg_start:msg_end],
+            "// Explain mode renders timing and cost into What happened",
+            "onMessage({ data: JSON.stringify({ type: 'timing', stages: { stt: 0.421, mask: 0.112, total_response: 1.534 } }) });",
+            "onMessage({ data: JSON.stringify({ type: 'cost', total: 0.0023, stages: { stt: { usd: 0.0004, measured: false }, agent: { usd: 0.0019, measured: true } } }) });",
+            "const explainResult = { count: rows.length, pill: pill.textContent, html: rows[0] ? rows[0].innerHTML : '' };",
+            "// Quick mode skips metrics rendering",
+            "rows.length = 0; pill.textContent = '0'; mode = 'quick';",
+            "onMessage({ data: JSON.stringify({ type: 'timing', stages: { total_response: 0.5 } }) });",
+            "onMessage({ data: JSON.stringify({ type: 'cost', total: 0.001, stages: {} }) });",
+            "const quickResult = { count: rows.length, pill: pill.textContent };",
+            "console.log(JSON.stringify({ explainResult, quickResult }));",
+        ]
+    )
+    proc = subprocess.run(["node", "-"], input=script, text=True, capture_output=True, check=False)
+    assert proc.returncode == 0, proc.stderr
+    result = json.loads(proc.stdout)
+    assert result["explainResult"]["count"] == 1
+    assert str(result["explainResult"]["pill"]) == "1"
+    assert "1.534 s" in result["explainResult"]["html"]
+    assert "$0.0023" in result["explainResult"]["html"]
+    assert "(est)" in result["explainResult"]["html"]
+    assert result["quickResult"] == {"count": 0, "pill": "0"}
 
 
 def test_interrupt_while_thinking_combines_questions_and_while_speaking_starts_new_question(
@@ -1591,14 +1762,6 @@ def test_session_check_follows_the_live_runner() -> None:
     assert gone.status_code == 401
 
 
-@pytest.mark.skipif(not os.getenv("GOOGLE_API_KEY"), reason="GOOGLE_API_KEY is not set")
-async def test_live_transcribe_when_api_key_set() -> None:
-    from src.voice.stt import transcribe
-
-    text, _usage = await transcribe(b"\x00\x00" * 1600)
-    assert isinstance(text, str)
-
-
 def test_live_utterance_pads_trailing_silence_for_burst_audio_and_handles_activity_end(
     monkeypatch,
 ) -> None:
@@ -1682,3 +1845,362 @@ def test_live_utterance_pads_trailing_silence_for_burst_audio_and_handles_activi
             pass
 
     asyncio.run(run())
+
+
+def test_voice_masking_persists_masked_and_sanitized_with_span_timing_cost_and_stt_measured(
+    monkeypatch,
+) -> None:
+    import asyncio
+    import json
+    from contextlib import contextmanager
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from src.voice import router
+
+    recorded: list[tuple[str, str, str]] = []
+    spans: list[tuple[str, dict]] = []
+
+    class FakeSpan:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.attrs: dict = {}
+
+        def set_attribute(self, key: str, value) -> None:
+            self.attrs[key] = value
+
+    class FakeTracer:
+        @contextmanager
+        def start_as_current_span(self, name: str):
+            sp = FakeSpan(name)
+            spans.append((name, sp.attrs))
+            yield sp
+
+    monkeypatch.setattr(router, "get_tracer", lambda: FakeTracer())
+    monkeypatch.setattr(router, "settle_ms", lambda mode: 10)
+
+    async def synthesize_stream(text: str, usage_out: dict | None = None):
+        yield b"\x00\x01" * 40
+
+    monkeypatch.setattr(router, "synthesize_stream", synthesize_stream)
+
+    async def mask_text(seg: str) -> tuple[str, str]:
+        await asyncio.sleep(0.015)
+        return seg.replace("alice@example.com", "[EMAIL]"), "PII masked in the response"
+
+    async def pipeline(runner, user_id, text, **kwargs):
+        yield {
+            "type": "step",
+            "key": "sanitize",
+            "title": "Sanitizer",
+            "status": "passed",
+            "detail": "ok",
+            "span": "security.sanitize",
+            "ms": 1,
+            "clean_text": "clean user question",
+        }
+        full = "Your email is alice@example.com. Have a great day."
+        yield {"type": "delta", "text": "Your email is alice@example.com. "}
+        yield {"type": "delta", "text": full}
+        yield {"type": "final", "blocked": False, "response": full}
+
+    def _no_usage_open():
+        session = _ScriptedUtterance(["raw\x00 user question"])
+        session.usage = None
+        return session
+
+    monkeypatch.setattr(router, "open_utterance", _no_usage_open)
+
+    app = FastAPI()
+    app.include_router(
+        router.make_voice_router(
+            runners={"shopper": object()},
+            pipeline=pipeline,
+            record=lambda uid, role, content: recorded.append((uid, role, content)),
+            mask_enabled=lambda: True,
+            mask_text=mask_text,
+        )
+    )
+
+    with TestClient(app) as client:
+        with client.websocket_connect("/voice/ws?user_id=shopper") as ws:
+            ws.send_bytes(b"\x00\x01" * 1600)
+            ws.send_text(json.dumps({"type": "utterance_end", "commit": True}))
+            events = _events(ws, limit=50)
+
+    assert recorded == [
+        ("shopper", "user", "clean user question"),
+        ("shopper", "assistant", "Your email is [EMAIL]. Have a great day."),
+    ]
+    turn_spans = [attrs for name, attrs in spans if name == "voice.turn"]
+    assert turn_spans
+    assert turn_spans[0].get("output.value") == "Your email is [EMAIL]. Have a great day."
+
+    mask_spans = [attrs for name, attrs in spans if name == "security.a2a_mask"]
+    assert len(mask_spans) == 2
+    assert "[EMAIL]" in mask_spans[0].get("output.value", "")
+
+    mask_steps = [e for e in events if e.get("type") == "step" and e.get("key") == "mask"]
+    assert len(mask_steps) == 1
+    assert mask_steps[0]["ms"] >= 10
+
+    timing_ev = next(e for e in events if e.get("type") == "timing")
+    assert timing_ev["stages"]["mask"] >= 0.02
+
+    cost_ev = next(e for e in events if e.get("type") == "cost")
+    assert "mask" in cost_ev["stages"]
+    assert cost_ev["stages"]["mask"]["in"] > 0
+    assert cost_ev["stages"]["stt"]["measured"] is False
+
+
+def test_voice_mask_flag_reflects_runtime_env_dynamically(monkeypatch) -> None:
+    import json
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from src.voice import router
+
+    flags: list[dict] = []
+
+    async def synthesize_stream(text: str, usage_out: dict | None = None):
+        yield b"\x00\x01" * 40
+
+    async def pipeline(runner, user_id, text, **kwargs):
+        flags.append(dict(kwargs))
+        yield {"type": "final", "blocked": False, "response": "Done."}
+
+    monkeypatch.setenv("MASK", "true")
+    monkeypatch.setattr(router, "synthesize_stream", synthesize_stream)
+    _install_scripted(monkeypatch, ["first", "second"])
+
+    app = FastAPI()
+    app.include_router(
+        router.make_voice_router(
+            runners={"shopper": object()},
+            pipeline=pipeline,
+            mask_enabled=lambda: os.getenv("MASK", "true").lower() == "true",
+        )
+    )
+    with TestClient(app) as client:
+        with client.websocket_connect("/voice/ws?user_id=shopper") as ws:
+            ws.send_bytes(b"\x00\x01" * 160)
+            ws.send_text(json.dumps({"type": "utterance_end", "commit": True}))
+            _events(ws)
+            monkeypatch.setenv("MASK", "false")
+            ws.send_bytes(b"\x00\x01" * 160)
+            ws.send_text(json.dumps({"type": "utterance_end", "commit": True}))
+            _events(ws)
+
+    assert flags[0]["mask"] is True
+    assert flags[1]["mask"] is False
+
+
+def test_voice_off_topic_redirect_speaks_audio_caches_pcm_and_skips_record(monkeypatch) -> None:
+    import json
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from src.voice import router
+
+    spoken: list[str] = []
+    recorded: list[tuple] = []
+    redirect = "I can only help with your orders, returns, and shipping questions."
+
+    async def synthesize_stream(text: str, usage_out: dict | None = None):
+        spoken.append(text)
+        yield b"\x01\x02" * 120
+
+    async def pipeline(runner, user_id, text, **kwargs):
+        yield {
+            "type": "final",
+            "blocked": True,
+            "stage": "judge",
+            "reason": "off_topic",
+            "response": redirect,
+        }
+
+    monkeypatch.setattr(router, "synthesize_stream", synthesize_stream)
+    _install_scripted(monkeypatch, ["tell me a joke", "another joke"])
+    app = FastAPI()
+    app.include_router(
+        router.make_voice_router(
+            runners={"shopper": object()},
+            pipeline=pipeline,
+            record=lambda uid, role, content: recorded.append((uid, role, content)),
+        )
+    )
+    with TestClient(app) as client:
+        with client.websocket_connect("/voice/ws?user_id=shopper") as ws:
+            ws.send_bytes(b"\x00\x01" * 160)
+            ws.send_text(json.dumps({"type": "utterance_end", "commit": True}))
+            events1 = _events(ws, limit=30)
+
+            ws.send_bytes(b"\x00\x01" * 160)
+            ws.send_text(json.dumps({"type": "utterance_end", "commit": True}))
+            events2 = _events(ws, limit=30)
+
+    assert any(e.get("type") == "_audio" and e["n"] > 0 for e in events1)
+    assert any(e.get("type") == "_audio" and e["n"] > 0 for e in events2)
+    blocked_ev = next(e for e in events1 if e.get("type") == "blocked")
+    assert blocked_ev["stage"] == "judge"
+    assert blocked_ev["reason"] == "off_topic"
+    assert blocked_ev["response"] == redirect
+    assert events1[-1] == {"type": "turn_end"}
+    assert events2[-1] == {"type": "turn_end"}
+    # Synthesized once, replayed from static PCM cache on second turn
+    assert spoken == [redirect]
+    assert recorded == []
+
+
+def test_voice_pipeline_error_does_not_fall_through_to_empty_tts(monkeypatch) -> None:
+    import json
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from src.voice import router
+
+    spoken: list[str] = []
+
+    async def synthesize_stream(text: str, usage_out: dict | None = None):
+        spoken.append(text)
+        yield b"\x01\x02" * 40
+
+    async def pipeline(runner, user_id, text, **kwargs):
+        yield {"type": "error", "error": "Security Judge unreachable: connection refused"}
+
+    monkeypatch.setattr(router, "synthesize_stream", synthesize_stream)
+    _install_scripted(monkeypatch, ["where is my order"])
+    app = FastAPI()
+    app.include_router(
+        router.make_voice_router(
+            runners={"shopper": object()},
+            pipeline=pipeline,
+        )
+    )
+    with TestClient(app) as client:
+        with client.websocket_connect("/voice/ws?user_id=shopper") as ws:
+            ws.send_bytes(b"\x00\x01" * 160)
+            ws.send_text(json.dumps({"type": "utterance_end", "commit": True}))
+            events = _events(ws, limit=30)
+
+    error_events = [e for e in events if e.get("type") == "error"]
+    assert len(error_events) == 1
+    assert "Security Judge unreachable" in error_events[0]["message"]
+    assert not any(e.get("type") == "response_text" for e in events)
+    assert not any(e.get("type") == "_audio" for e in events)
+    assert spoken == []
+    assert events[-1] == {"type": "turn_end"}
+
+
+def test_voice_ws_guardrail_overrides_preserve_omitted_and_clear_on_null(monkeypatch) -> None:
+    import json
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from src.voice import router
+
+    flags: list[dict] = []
+
+    async def synthesize_stream(text: str, usage_out: dict | None = None):
+        yield b"\x00\x01" * 40
+
+    async def pipeline(runner, user_id, text, **kwargs):
+        flags.append(dict(kwargs))
+        yield {"type": "final", "blocked": False, "response": "Done."}
+
+    monkeypatch.setattr(router, "synthesize_stream", synthesize_stream)
+    _install_scripted(monkeypatch, ["one", "two", "three"])
+    app = FastAPI()
+    app.include_router(
+        router.make_voice_router(
+            runners={"shopper": object()},
+            pipeline=pipeline,
+            mask_enabled=lambda: True,
+        )
+    )
+    with TestClient(app) as client:
+        with client.websocket_connect("/voice/ws?user_id=shopper") as ws:
+            # 1. Quick mode with no overrides skips judge & mask
+            ws.send_text(json.dumps({"type": "mode", "mode": "quick"}))
+            ws.send_bytes(b"\x00\x01" * 160)
+            ws.send_text(json.dumps({"type": "utterance_end", "commit": True}))
+            _events(ws)
+
+            # 2. Explicit guardrails override enables judge only (mask omitted -> still False in quick)
+            ws.send_text(json.dumps({"type": "guardrails", "judge": True}))
+            ws.send_bytes(b"\x00\x01" * 160)
+            ws.send_text(json.dumps({"type": "utterance_end", "commit": True}))
+            _events(ws)
+
+            # 3. Mode message with explicit judge=null, mask=null clears override back to quick defaults
+            ws.send_text(json.dumps({"type": "mode", "mode": "quick", "judge": None, "mask": None}))
+            ws.send_bytes(b"\x00\x01" * 160)
+            ws.send_text(json.dumps({"type": "utterance_end", "commit": True}))
+            _events(ws)
+
+    assert flags[0]["judge"] is False and flags[0]["mask"] is False
+    assert flags[1]["judge"] is True and flags[1]["mask"] is False
+    assert flags[2]["judge"] is False and flags[2]["mask"] is False
+
+
+def test_ptt_cs_voice_on_tracks_active_capture_and_resets_when_idle() -> None:
+    import json
+    import subprocess
+    from pathlib import Path
+
+    source = (Path(__file__).resolve().parents[2] / "src" / "voice" / "ui.js").read_text(
+        encoding="utf-8"
+    )
+    assert "window.csVoiceOn = !pttMode;" in source
+    start = source.index("function floatToPcm(")
+    end = source.index("async function startCapture(", start)
+    script = "\n".join(
+        [
+            "const PTT_RELEASE_TAIL_MS = 1000;",
+            "const PREROLL_FRAMES = 3;",
+            "let speaking = false;",
+            "let voiceOn = true;",
+            "let pttActive = false;",
+            "let pttDownAt = 0;",
+            "let pttReleased = false;",
+            "let pttPaused = true;",
+            "let pttTailTimer = null;",
+            "let agentSpeaking = false;",
+            "let muted = false;",
+            "let frames = [];",
+            "let preroll = [];",
+            "let silentFrames = 0;",
+            "let onsetCount = 0;",
+            "const window = { csVoiceOn: false };",
+            "let tailCb = null;",
+            "function setTimeout(fn) { tailCb = fn; return 99; }",
+            "function clearTimeout() { tailCb = null; }",
+            "const ws = { readyState: 1, send() {} };",
+            "function now() { return 1000; }",
+            "function setVoiceStatus() {}",
+            "function stopPlayback() {}",
+            source[start:end],
+            "const beforeHold = window.csVoiceOn;",
+            "beginPtt();",
+            "const duringHold = window.csVoiceOn;",
+            "releasePtt();",
+            "const duringTail = window.csVoiceOn;",
+            "tailCb();",
+            "const afterIdle = window.csVoiceOn;",
+            "console.log(JSON.stringify({ beforeHold, duringHold, duringTail, afterIdle }));",
+        ]
+    )
+    proc = subprocess.run(["node", "-"], input=script, text=True, capture_output=True, check=False)
+    assert proc.returncode == 0, proc.stderr
+    result = json.loads(proc.stdout)
+    assert result == {
+        "beforeHold": False,
+        "duringHold": True,
+        "duringTail": True,
+        "afterIdle": False,
+    }

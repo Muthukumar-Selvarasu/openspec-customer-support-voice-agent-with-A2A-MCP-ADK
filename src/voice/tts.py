@@ -95,16 +95,3 @@ async def synthesize_stream(text: str, usage_out: dict | None = None):
                 usage_out.get("out", 0),
                 getattr(usage, "candidates_token_count", 0) or 0,
             )
-
-
-async def synthesize(text: str) -> bytes:
-    """Return the whole reply as one PCM blob."""
-    if not text.strip():
-        return b""
-    response = await _client().aio.models.generate_content(
-        model=TTS_MODEL,
-        contents=text,
-        config=_audio_config(),
-    )
-    part = response.candidates[0].content.parts[0]
-    return part.inline_data.data or b""

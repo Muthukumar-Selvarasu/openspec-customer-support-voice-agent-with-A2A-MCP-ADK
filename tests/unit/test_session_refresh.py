@@ -80,6 +80,29 @@ def test_session_without_a_runner_is_401(client: TestClient) -> None:
     assert missing.status_code == 401
 
 
+def test_login_returns_agent_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    _reset()
+    monkeypatch.setattr(
+        web,
+        "authenticate_user",
+        lambda email, password: {
+            "user_id": 1,
+            "email": SHOPPER,
+            "full_name": "Alice Jones",
+            "is_premium_customer": True,
+            "total_items_purchased": 4,
+        },
+    )
+    monkeypatch.setattr(web, "get_database_tools", lambda: [])
+    with TestClient(web.app) as http:
+        resp = http.post("/api/login", json={"email": SHOPPER, "password": "alice"})
+    _reset()
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["model"] == web.AGENT_MODEL
+
+
 def _page_script() -> str:
     from pathlib import Path
 
@@ -217,3 +240,63 @@ def test_page_restore_confirms_session_and_leave_does_not_log_out() -> None:
     assert result["frozen"] is None
     assert result["mic"] is None
     assert result["forgot"] is None
+
+
+def test_page_leave_allowed_after_ptt_turn_pauses_idle() -> None:
+    import json
+    import subprocess
+    from pathlib import Path
+
+    ui_source = (Path(__file__).resolve().parents[2] / "src" / "voice" / "ui.js").read_text(
+        encoding="utf-8"
+    )
+    ptt_start = ui_source.index("function clearPttTail(")
+    ptt_end = ui_source.index("function onFrame(", ptt_start)
+    script = "\n".join(
+        [
+            _page_script(),
+            "USER = 'alice.jones@example.com';",
+            "epoch = 'epoch-ptt';",
+            "const PTT_RELEASE_TAIL_MS = 1000;",
+            "let muted = false;",
+            "let pttActive = false;",
+            "let pttDownAt = 0;",
+            "let pttReleased = false;",
+            "let pttPaused = true;",
+            "let pttTailTimer = null;",
+            "let speaking = false;",
+            "let agentSpeaking = false;",
+            "let turnRunning = false;",
+            "let ignoreAudio = false;",
+            "let frames = [];",
+            "let preroll = [];",
+            "let silentFrames = 0;",
+            "let onsetCount = 0;",
+            "let tailCb = null;",
+            "function setTimeout(fn) { tailCb = fn; return 7; }",
+            "function clearTimeout() { tailCb = null; }",
+            "function now() { return 1000; }",
+            "function bargeIn() {}",
+            "function sendInterrupt() {}",
+            "function sendFrame() {}",
+            "function setVoiceStatus() {}",
+            "function endUtterance() { speaking = false; }",
+            ui_source[ptt_start:ptt_end],
+            "beginPtt();",
+            "const leaveDuringCapture = pageLeaveRequest({ persisted: false });",
+            "releasePtt();",
+            "const leaveDuringTail = pageLeaveRequest({ persisted: false });",
+            "tailCb();",
+            "const leaveAfterIdle = pageLeaveRequest({ persisted: false });",
+            "console.log(JSON.stringify({ leaveDuringCapture, leaveDuringTail, leaveAfterIdle }));",
+        ]
+    )
+    proc = subprocess.run(["node", "-"], input=script, text=True, capture_output=True, check=False)
+    assert proc.returncode == 0, proc.stderr
+    result = json.loads(proc.stdout)
+    assert result["leaveDuringCapture"] is None
+    assert result["leaveDuringTail"] is None
+    assert result["leaveAfterIdle"] == {
+        "url": "/api/page-leave",
+        "body": {"user_id": "alice.jones@example.com", "epoch": "epoch-ptt"},
+    }

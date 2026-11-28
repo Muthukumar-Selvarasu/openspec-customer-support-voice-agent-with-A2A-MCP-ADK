@@ -54,14 +54,6 @@
   if (!inwrap) return;
 
   const micSvg = '<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" style="vertical-align:middle" aria-hidden="true"><path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3zm5-3c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/></svg>';
-  const holdBtn = document.createElement("button");
-  holdBtn.type = "button";
-  holdBtn.id = "hold";
-  holdBtn.className = "vbtn";
-  holdBtn.textContent = "Mute";
-  holdBtn.title = "Mute microphone";
-  holdBtn.style.display = "none";
-  inwrap.insertBefore(holdBtn, document.getElementById("send"));
 
   const micBtn = document.createElement("button");
   micBtn.type = "button";
@@ -80,23 +72,33 @@
     status.parentNode.insertBefore(pttHint, status.nextSibling);
   }
 
-  function sendDemoMode() {
+  function sendDemoMode(clearOverrides) {
     if (ws && ws.readyState === 1 && typeof demoMode === "function") {
-      ws.send(JSON.stringify({ type: "mode", mode: demoMode() }));
+      if (clearOverrides) {
+        ws.send(JSON.stringify({ type: "mode", mode: demoMode(), judge: null, mask: null }));
+      } else {
+        ws.send(JSON.stringify({ type: "mode", mode: demoMode() }));
+      }
     }
   }
   window.csSendDemoMode = sendDemoMode;
 
   function sendGuardrails() {
-    if (ws && ws.readyState === 1 && typeof judgeEnabled === "function" && typeof maskEnabled === "function") {
-      ws.send(JSON.stringify({ type: "guardrails", judge: judgeEnabled(), mask: maskEnabled() }));
+    if (ws && ws.readyState === 1 && typeof explicitGuardrails === "function") {
+      const overrides = explicitGuardrails();
+      if (Object.keys(overrides).length) {
+        ws.send(JSON.stringify({ type: "guardrails", ...overrides }));
+      }
     }
   }
   window.csSendGuardrails = sendGuardrails;
 
   function setVoiceStatus(text) {
     status.textContent = text ? "🎙 " + text : "";
-    micBtn.classList.toggle("live", voiceOn && !pttPaused && !pttTailTimer);
+    const capturing = voiceOn && (pttActive || !!pttTailTimer);
+    const ready = voiceOn && !pttPaused && !pttActive && !pttTailTimer;
+    micBtn.classList.toggle("on", capturing);
+    micBtn.classList.toggle("live", ready);
   }
 
   function now() {
@@ -207,6 +209,7 @@
   function finishPttRelease() {
     if (typeof pttTailTimer !== "undefined") pttTailTimer = null;
     if (typeof pttPaused !== "undefined") pttPaused = true;
+    if (typeof window !== "undefined") window.csVoiceOn = false;
     if (speaking) {
       endUtterance(true);
     } else {
@@ -218,6 +221,7 @@
     if (muted) return;
     clearPttTail();
     if (typeof pttPaused !== "undefined") pttPaused = false;
+    if (typeof window !== "undefined") window.csVoiceOn = true;
     if (typeof ignoreAudio !== "undefined") ignoreAudio = true;
     pttActive = true;
     pttDownAt = now();
@@ -306,8 +310,7 @@
     silentFrames += 1;
     const silenceMs = silentFrames * frameMs;
     if (silenceMs >= END_SILENCE_MS) {
-      if (typeof pttPaused !== "undefined") pttPaused = true;
-      endUtterance(true);
+      endUtterance(false);
     }
   }
 
@@ -347,6 +350,51 @@
     frames = [];
     preroll = [];
     onsetCount = 0;
+  }
+
+  function renderVoiceMetrics(data) {
+    if (typeof demoMode === "function" && demoMode() === "quick") return;
+    if (typeof stepsPanel !== "function") return;
+    const panel = stepsPanel(ensureNode());
+    if (!panel) return;
+    let row = panel.querySelector('.step[data-key="metrics"]');
+    if (!row) {
+      row = el('<div class="step" data-key="metrics"></div>');
+      panel.appendChild(row);
+      const pill = panel.querySelector(".pill");
+      if (pill) pill.textContent = panel.querySelectorAll(".step").length;
+    }
+    if (data.type === "timing") row._timing = data.stages || {};
+    if (data.type === "cost") row._cost = data;
+    const t = row._timing || {};
+    const c = row._cost || null;
+    const parts = [];
+    if (t.total_response != null) {
+      parts.push(`Total latency: ${Number(t.total_response).toFixed(3)} s`);
+    }
+    if (c && c.total != null) {
+      parts.push(`Cost: $${Number(c.total).toFixed(4)}`);
+    }
+    const stageDetails = [];
+    if (t.stt != null) stageDetails.push(`STT ${Number(t.stt).toFixed(3)}s`);
+    if (t.judge != null) stageDetails.push(`Judge ${Number(t.judge).toFixed(3)}s`);
+    if (t.mask != null) stageDetails.push(`Mask ${Number(t.mask).toFixed(3)}s`);
+    if (t.tts_start != null) stageDetails.push(`TTFA ${Number(t.tts_start).toFixed(3)}s`);
+    if (c && c.stages) {
+      Object.entries(c.stages).forEach(([k, v]) => {
+        if (v && v.usd != null) {
+          stageDetails.push(`${k}: $${Number(v.usd).toFixed(4)}${v.measured === false ? " (est)" : ""}`);
+        }
+      });
+    }
+    const summary = parts.join(" · ") || "Turn metrics";
+    const sub = stageDetails.join(" · ");
+    const safe = typeof esc === "function" ? esc : (v) => String(v);
+    row.innerHTML =
+      `<div class="call"><span class="ic ok">✓</span><span class="kb kb-voice">Metrics</span><b>Latency &amp; Cost</b><span class="state">done</span></div>` +
+      `<div class="what">${safe(summary)}</div>` +
+      (sub ? `<div class="sub">${safe(sub)}</div>` : "");
+    if (typeof scroll === "function") scroll();
   }
 
   function ensureUserBubble() {
@@ -466,6 +514,7 @@
         break;
       case "timing":
       case "cost":
+        renderVoiceMetrics(data);
         break;
       case "error":
         turnRunning = false;
@@ -497,7 +546,7 @@
     if (startingVoice) return startingVoice;
     const pttMode = !!(opts && opts.ptt);
     startingVoice = (async () => {
-      window.csVoiceOn = true;
+      window.csVoiceOn = !pttMode;
       const AudioCtx = window.AudioContext || window.webkitAudioContext;
       playCtx = new AudioCtx();
       if (playCtx.state === "suspended") await playCtx.resume();
@@ -518,7 +567,6 @@
       pttPaused = pttMode;
       const chips = document.getElementById("chips");
       if (chips) chips.remove();
-      holdBtn.style.display = "none";
       setVoiceStatus(pttMode ? "" : "listening…");
     })();
     try {
@@ -549,32 +597,8 @@
       try { ws.close(); } catch (err) { /* already closed */ }
       ws = null;
     }
-    holdBtn.style.display = "none";
-    holdBtn.textContent = "Mute";
-    holdBtn.title = "Mute microphone";
-    holdBtn.classList.remove("on");
     dropUnansweredTurn();
     setVoiceStatus("");
-  }
-
-  function toggleHold() {
-    if (!voiceOn) return;
-    muted = !muted;
-    if (muted) {
-      speaking = false;
-      frames = [];
-      preroll = [];
-      onsetCount = 0;
-      holdBtn.textContent = "Unmute";
-      holdBtn.title = "Unmute microphone";
-      holdBtn.classList.add("on");
-      setVoiceStatus("muted");
-      return;
-    }
-    holdBtn.textContent = "Mute";
-    holdBtn.title = "Mute microphone";
-    holdBtn.classList.remove("on");
-    setVoiceStatus(agentSpeaking ? "speaking…" : (pttPaused ? "" : "listening…"));
   }
 
   function onMicPressStart(event) {
@@ -584,7 +608,6 @@
     if (typeof USER === "undefined" || !USER) return;
     micPressHeld = true;
     pttDownAt = now();
-    holdBtn.style.display = "none";
     if (voiceOn) {
       beginPtt();
       return;
@@ -594,8 +617,11 @@
         if (micPressHeld) {
           beginPtt();
         } else {
-          beginPtt();
-          releasePtt();
+          pttActive = false;
+          pttPaused = true;
+          speaking = false;
+          if (typeof window !== "undefined") window.csVoiceOn = false;
+          setVoiceStatus("");
         }
       })
       .catch((err) => {
@@ -607,13 +633,13 @@
   function onMicPressEnd() {
     if (!micPressHeld && !pttActive) return;
     micPressHeld = false;
-    holdBtn.style.display = "none";
     if (pttActive) {
       releasePtt();
       return;
     }
     pttPaused = true;
     speaking = false;
+    if (typeof window !== "undefined") window.csVoiceOn = false;
     setVoiceStatus("");
   }
 
@@ -626,7 +652,6 @@
     if (micPressHeld || pttActive) onMicPressEnd();
   });
   micBtn.onclick = () => {
-    holdBtn.style.display = "none";
     if (pttReleased) {
       pttReleased = false;
       return;
@@ -639,6 +664,7 @@
       } else if (speaking) {
         endUtterance(true);
       } else {
+        if (typeof window !== "undefined") window.csVoiceOn = false;
         setVoiceStatus("");
       }
     }
@@ -660,6 +686,7 @@
             pttActive = false;
             pttPaused = true;
             speaking = false;
+            if (typeof window !== "undefined") window.csVoiceOn = false;
             setVoiceStatus("");
           }
         })
@@ -673,10 +700,8 @@
     tabHeld = false;
     if (!pttActive) return;
     event.preventDefault();
-    holdBtn.style.display = "none";
     releasePtt();
   });
-  holdBtn.onclick = toggleHold;
   window.addEventListener("cs:logout", () => {
     try { stopVoice(); } catch (err) { /* page is going away */ }
   });

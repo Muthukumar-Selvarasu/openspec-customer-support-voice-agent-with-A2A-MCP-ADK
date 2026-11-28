@@ -24,9 +24,10 @@ from src.api.web import (
     AGENT_MODEL,
     _enforce_tenant_tool_callback,
     get_database_tools,
+    mask_enabled,
     resolve_service_settings,
 )
-from src.core.greet import authenticate_user, get_user_actions, resolve_postgres_dsn
+from src.core.greet import authenticate_user, get_user_actions, greet_user, resolve_postgres_dsn
 from src.core.memory import make_memory_search_tool, save_memory, search_memory
 from src.core.prompts import SQL_PROMPT_INSTRUCTION
 from src.core.telemetry import ATTR, get_tracer
@@ -164,7 +165,7 @@ async def run_turn(runner: Runner, user_id: str, user_input: str, messages: list
         return None
     messages.append({"role": "user", "content": clean})
     content = types.Content(role="user", parts=[types.Part(text=clean)])
-    tool_calls_log: list[dict] = []
+    pending_tool_calls: dict[str, list[dict]] = {}
     tool_results_log: list[dict] = []
     masked_text = None
     with tracer.start_as_current_span("agent.turn") as turn_span:
@@ -178,7 +179,7 @@ async def run_turn(runner: Runner, user_id: str, user_input: str, messages: list
         )
         for event in response:
             for call in event.get_function_calls() or []:
-                tool_calls_log.append({"name": call.name, "args": call.args})
+                pending_tool_calls.setdefault(call.name, []).append(call.args or {})
                 if SHOW_TOOL_CALLS:
                     print(f"  [tool] -> {call.name}({_fmt_tool_args(call.args)})")
             for result in event.get_function_responses() or []:
@@ -193,17 +194,15 @@ async def run_turn(runner: Runner, user_id: str, user_input: str, messages: list
                 with tracer.start_as_current_span(f"tool.{result.name}") as tool_span:
                     tool_span.set_attribute(ATTR.OPENINFERENCE_SPAN_KIND, "TOOL")
                     tool_span.set_attribute(ATTR.TOOL_NAME, result.name)
-                    matching = next(
-                        (item for item in tool_calls_log if item["name"] == result.name),
-                        {},
-                    )
+                    queued = pending_tool_calls.get(result.name)
+                    call_args = queued.pop(0) if queued else {}
                     tool_span.set_attribute(
-                        ATTR.INPUT_VALUE, json.dumps(matching.get("args", {}), default=str)
+                        ATTR.INPUT_VALUE, json.dumps(call_args, default=str)
                     )
                     tool_span.set_attribute(ATTR.OUTPUT_VALUE, resp_str[:500])
             if event.is_final_response() and event.content and event.content.parts:
                 raw_text = event.content.parts[0].text or ""
-                masked_text = await _mask_response(raw_text)
+                masked_text = await _mask_response(raw_text) if mask_enabled() else raw_text
                 turn_span.set_attribute(ATTR.OUTPUT_VALUE, masked_text)
                 print("Agent: ", masked_text)
                 messages.append({"role": "assistant", "content": masked_text})
@@ -213,6 +212,8 @@ async def run_turn(runner: Runner, user_id: str, user_input: str, messages: list
 def _print_known_shoppers() -> None:
     import psycopg2
 
+    conn = None
+    cur = None
     try:
         conn = psycopg2.connect(resolve_postgres_dsn())
         cur = conn.cursor()
@@ -220,10 +221,13 @@ def _print_known_shoppers() -> None:
         rows = cur.fetchall()
         headers = [desc[0] for desc in cur.description]
         print(tabulate(rows, headers=headers, tablefmt="grid"))
-        cur.close()
-        conn.close()
     except Exception as exc:
         print(f"Could not list shoppers: {exc}")
+    finally:
+        if cur is not None:
+            cur.close()
+        if conn is not None:
+            conn.close()
 
 
 def _print_main_menu() -> None:
@@ -258,15 +262,14 @@ async def main() -> None:
     print("=" * 80)
     email = input("Enter your email: ").strip()
     password = getpass("Enter your password: ").strip()
-    await _show_loading("[1/3] Authenticating user")
+    await _show_loading("[1/2] Authenticating user")
     user_context = authenticate_user(email=email, password=password)
     if not user_context:
         print("Not authorized. Exiting demo.")
         return
 
     user_id = user_context["email"]
-    await _show_loading("[2/3] Loading current orders")
-    await _show_loading("[3/3] Loading previous actions")
+    await _show_loading("[2/2] Loading previous actions")
     actions = get_user_actions(user_id)
     if actions:
         print("\n--- Your action history ---")
@@ -285,18 +288,7 @@ async def main() -> None:
     else:
         print("\nNo previous actions recorded.\n")
 
-    name = user_context["full_name"]
-    if user_context["is_premium_customer"]:
-        print(
-            f"Agent: Hello {name}! Welcome to the Customer Support Assistant. "
-            "How can I help you today? You are a premium customer and have "
-            f"{user_context['total_items_purchased']} items purchased."
-        )
-    else:
-        print(
-            f"Agent: Hello {name}! Welcome to the Customer Support Assistant. "
-            "How can I help you today?"
-        )
+    print(greet_user(user_context["user_id"]))
     _print_main_menu()
 
     root_agent = LlmAgent(
@@ -306,6 +298,9 @@ async def main() -> None:
         instruction=SQL_PROMPT_INSTRUCTION.format(USER_ID=user_id),
         tools=[*get_database_tools(), make_memory_search_tool(user_id)],
         before_tool_callback=_enforce_tenant_tool_callback,
+        generate_content_config=types.GenerateContentConfig(
+            thinking_config=types.ThinkingConfig(thinking_budget=0)
+        ),
     )
     session_service = InMemorySessionService()
     runner = Runner(agent=root_agent, app_name="agents", session_service=session_service)

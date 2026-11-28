@@ -7,14 +7,14 @@ Defines the shopper FastAPI app, glass-box UI, architecture visualization, opera
 ## Requirements
 
 ### Requirement: Idempotent Login and Single Mem0 Flush on Logout
-`POST /api/login` SHALL authenticate against `users` and create or reuse a session. `POST /api/logout` SHALL flush the transcript to Mem0 once.
+`POST /api/login` SHALL authenticate against `users`, create or reuse a session, and return `ok`, `user_id`, `full_name`, `is_premium`, `items`, and `model`. `POST /api/logout` SHALL flush the transcript to Mem0 once.
 
 #### Scenario: Login hydrates the profile
 - **WHEN** valid email and password are posted to `/api/login`
-- **THEN** the response includes `user_id`, `full_name`, and Premium flag
+- **THEN** the response includes `user_id`, `full_name`, `is_premium`, `items`, and `model`
 
 ### Requirement: Chat and Streamed Inspector Events
-`POST /api/chat` SHALL return the final assistant text. `POST /api/chat/stream` SHALL emit NDJSON for the stages that run. Explain, and a request that omits mode, SHALL include sanitizer, judge, tool_call, tool_result, masker, and final. Quick SHALL include sanitizer and final, SHALL omit judge and masker, and SHALL still return the assistant text.
+`POST /api/chat` SHALL return the final assistant text (passing `stream=False` to `text_pipeline`, including in Quick mode), and `POST /api/chat/stream` SHALL emit NDJSON for the stages that run. Explain (or omitted mode) SHALL run sanitizer, judge, tools, masker, and final; Quick SHALL run sanitizer and final and omit judge and masker even after normal browser login unless explicitly overridden. Both endpoints SHALL record sanitized user text in `_transcripts` / Mem0.
 
 #### Scenario: Root pages are served
 - **WHEN** a client GETs `/` or `/architecture` or `/architecture.svg`
@@ -27,6 +27,10 @@ Defines the shopper FastAPI app, glass-box UI, architecture visualization, opera
 #### Scenario: Quick stream skips judge and masker
 - **WHEN** a signed-in client posts `/api/chat/stream` with mode `quick`
 - **THEN** the NDJSON includes sanitizer and final, and includes neither judge nor masker
+
+#### Scenario: Quick stream skips judge and masker after normal browser login
+- **WHEN** a shopper signs in via the browser without manually clicking `#toggleJudge` or `#toggleMask` and sends a `quick` turn
+- **THEN** `/api/guardrails` is not pre-populated with forced `true` overrides and the NDJSON includes sanitizer and final with neither judge nor masker
 
 ### Requirement: Demo mode toggle
 The shopper page SHALL offer Explain and Quick, with Explain as the default. The choice SHALL persist in the browser and SHALL be sent on each streamed chat turn and each voice turn. Explain SHALL show the "What happened" panel. Quick SHALL hide that panel and show the assistant answer.
@@ -55,11 +59,19 @@ An ADK `before_tool_callback` SHALL overwrite cross-tenant emails/`user_id` with
 - **THEN** the callback blocks the call
 
 ### Requirement: CLI Uses Sanitized Input and Preserves Casing
-The operator CLI SHALL pass the sanitized string to `runner.run()` and MUST NOT lowercase the masked assistant reply.
+The operator CLI SHALL pass sanitized text to `runner.run()`, preserve masked reply casing, honor `MASK=false` via `mask_enabled()`, reuse `greet_user()`, set `thinking_budget=0`, close DB handles in a `finally:` block, omit fake no-op order-loading sleeps, and trace repeated tool calls FIFO.
 
 #### Scenario: CLI validate_input returns clean text
 - **WHEN** `validate_input` succeeds
 - **THEN** the returned string is the sanitized text used for the run
+
+#### Scenario: CLI skips masking when MASK=false
+- **WHEN** `MASK=false` and `run_turn` executes in `src/api/cli.py`
+- **THEN** `_mask_response` is skipped and the raw agent reply is returned
+
+#### Scenario: CLI traces repeated calls to the same tool with distinct args
+- **WHEN** the CLI agent invokes the same tool twice in one turn with different arguments
+- **THEN** each `tool.<name>` span records its own call arguments in FIFO order
 
 ### Requirement: Env-Driven Service URLs
 The web app SHALL read `TOOLBOX_URL`, `A2A_JUDGE_HOST`, `A2A_JUDGE_PORT`, `A2A_MASK_HOST`, `A2A_MASK_PORT`, `PHOENIX_URL`, `PHOENIX_PUBLIC_URL`, `HOST`, and `PORT` with localhost defaults. `WEB_PORT` MUST be accepted as an alias of `PORT`. Importing `src.api.web` MUST NOT require a running MCP Toolbox process.
@@ -106,7 +118,7 @@ Sign out SHALL drop the server session, flush the transcript to Mem0 once, forge
 - **THEN** the server session is gone, the transcript was flushed once, and the next load shows the login form
 
 ### Requirement: Tab close flushes only if the tab does not return
-Leaving the page SHALL NOT drop the server session before a reload of that same tab can keep it. A leave that no reload confirms SHALL drop the server session and SHALL flush the transcript to Mem0 once. A frozen page and an open microphone SHALL NOT schedule that flush.
+Leaving the page SHALL NOT drop the server session before a reload of that same tab can keep it. A leave that no reload confirms SHALL drop the server session and SHALL flush the transcript to Mem0 once. A frozen page and an actively capturing microphone SHALL NOT schedule that flush, whereas an idle paused Push-to-Talk session SHALL allow tab-close flush.
 
 #### Scenario: Reload cancels the flush
 - **WHEN** the shopper reloads and the new page confirms the server session
@@ -121,8 +133,12 @@ Leaving the page SHALL NOT drop the server session before a reload of that same 
 - **THEN** no flush is scheduled
 
 #### Scenario: Open microphone does not schedule a flush
-- **WHEN** the microphone is on and the page hides
+- **WHEN** the microphone is actively capturing speech and the page hides
 - **THEN** no flush is scheduled
+
+#### Scenario: Idle Push-to-Talk session allows tab-close flush
+- **WHEN** a shopper completes a Push-to-Talk turn, releases the mic so PTT pauses idle, and then closes the tab
+- **THEN** `window.csVoiceOn` is false, `/api/page-leave` is beaconed, and Mem0 is flushed after the grace window
 
 ### Requirement: Shared Design System Stylesheet Delivery
 The web app SHALL serve a shared design-system stylesheet at `/theme.css` from `src/static/`, defining the light-only color, typography, radius, shadow, glass, and motion tokens from `docs/DESIGN.md`.
@@ -143,11 +159,15 @@ The shopper page and architecture inspector SHALL default to a pure-white (`#fff
 - **THEN** the HTML links `/theme.css`, uses the sticky glass header, and renders the diagram card with `--lift` shadow and semantic status swatches
 
 ### Requirement: Light and Dark Theme Toggle
-The shopper page and architecture inspector SHALL provide a header theme toggle (`#themeToggle`) that switches between `light` (preserving the pure-white default theme) and `dark` (`data-theme="dark"` on `<html>`), persisting the choice in `localStorage["cs-theme"]`.
+The shopper page and architecture inspector SHALL provide `#themeToggle` switching between light and dark (`data-theme="dark"`), persisted in `localStorage["cs-theme"]` and synced across tabs via `storage` events on both pages. On `/`, `.ds-aurora`/`.ds-grain` SHALL sit outside `.login` (removed on sign-in) and `.steps summary .pill` SHALL NOT inherit `.pill:hover` lift.
 
 #### Scenario: Switching to dark theme persists across pages
 - **WHEN** a user clicks `#themeToggle` to switch to dark mode
 - **THEN** `document.documentElement` receives `data-theme="dark"`, `localStorage["cs-theme"]` stores `"dark"`, and both `/` and `/architecture` honor the dark palette on load
+
+#### Scenario: Theme toggle live-syncs between open chat and architecture tabs
+- **WHEN** a user toggles `#themeToggle` in `/architecture` while `/` is open in another tab
+- **THEN** `/` receives the `storage` event for `cs-theme` and updates its `data-theme` attribute immediately
 
 ### Requirement: Semantic Status and Voice Control Styling
 Chat bubbles, pipeline step cards, order status badges, and voice controls SHALL use the semantic palette (`--teal` for primary actions and active voice, `--coral` / `--coral-ink` for active recording warnings and blocked states, `--green` / `--green-soft` for completion, `--gold-ink` for eyebrows/LLM steps) and meet WCAG AA contrast on small text.
@@ -162,3 +182,18 @@ All interactive buttons, links, inputs, and chips SHALL display a visible keyboa
 #### Scenario: Reduced motion disables animations
 - **WHEN** the browser prefers reduced motion (`prefers-reduced-motion: reduce`)
 - **THEN** aurora drift, card lift transitions, and message entrance animations are disabled
+
+### Requirement: Guardrail Toggle API and Session Lifecycle Endpoints
+The web app SHALL expose `POST /api/guardrails` (with `bool | null` override clearing while leaving omitted fields unchanged), accept per-turn `judge`/`mask` overrides on `/api/chat` and `/api/chat/stream`, clear `_guardrails` on login/logout/flush, and expose `POST /api/session` and `POST /api/page-leave`. Phoenix project lookups for trace links SHALL run off the asyncio event loop with a failure cooldown.
+
+#### Scenario: Guardrail toggles override defaults and clear on explicit null
+- **WHEN** a client calls `POST /api/guardrails` with `{user_id, judge: false, mask: false}` and later calls `POST /api/guardrails` with `{user_id, judge: null, mask: null}`
+- **THEN** the overrides apply while set and are cleared back to mode defaults when explicit `null` is sent, and logging in again or flushing on tab close also clears stale overrides
+
+#### Scenario: Session and page-leave endpoints preserve reloads and flush closed tabs
+- **WHEN** a tab sends `POST /api/page-leave` with an epoch and no `POST /api/session` cancels it within `PAGE_LEAVE_GRACE_MS`
+- **THEN** the server flushes the transcript to Mem0 once and drops the in-memory runner
+
+#### Scenario: Unreachable Phoenix does not block async chat or voice handlers
+- **WHEN** `TELEMETRY=true` and `PHOENIX_URL` is unreachable during `/api/chat/stream` or `/voice/ws`
+- **THEN** the Phoenix `/v1/projects` lookup executes off the event loop and subsequent turns within the failure cooldown return the fallback `/projects` link without blocking

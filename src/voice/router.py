@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
 import re
@@ -25,6 +26,7 @@ _BYTES_PER_SEC = TTS_SAMPLE_RATE * 2
 _SENT_END = re.compile(r"[.!?…](?:[\"')\]]+)?(?:\s|$)")
 _CLAUSE_END = re.compile(r"[:;]\s+|\n+")
 _MIN_CLAUSE_CHARS = 24
+_REDIRECT_PCM_CACHE: dict[tuple[int, str, str, str], bytes] = {}
 
 
 def _flag(name: str, default: str) -> bool:
@@ -59,14 +61,15 @@ def refresh_flags() -> None:
 
 
 def _config_warnings() -> list[str]:
-    """Warn when streaming is requested together with masking. Masking wins."""
+    """Warn when raw streaming is requested together with masking. Masking wins."""
     refresh_flags()
     if not (AGENT_RESPONSE_STREAM and MASK_ENABLED):
         return []
     return [
-        "AGENT_RESPONSE_STREAM=true is being IGNORED because MASK=true. A reply "
-        "cannot be masked while it is spoken sentence-by-sentence, so streaming is "
-        "turned OFF. Set MASK=false to enable streaming."
+        "AGENT_RESPONSE_STREAM=true is being IGNORED because MASK=true. Raw "
+        "streaming without masking is turned OFF while MASK=true (Explain voice "
+        "turns still mask each finished sentence via A2A before speaking). Set "
+        "MASK=false to enable raw streaming."
     ]
 
 
@@ -75,13 +78,19 @@ def print_config_warnings() -> None:
         print(f"\033[1;33mWARNING (voice config):\033[0m {message}")
 
 
-def _take_complete(buf: str) -> tuple[str, str]:
+def _take_complete(buf: str, *, mask: bool = False) -> tuple[str, str]:
     matches = list(_SENT_END.finditer(buf))
     if matches:
         cut = matches[-1].end()
         return buf[:cut], buf[cut:]
     for match in reversed(list(_CLAUSE_END.finditer(buf))):
         if match.end() >= _MIN_CLAUSE_CHARS:
+            if (
+                mask
+                and match.group(0).startswith("\n")
+                and buf[: match.start()].rstrip(" \t").endswith(",")
+            ):
+                continue
             cut = match.end()
             return buf[:cut], buf[cut:]
     return "", buf
@@ -103,8 +112,14 @@ def make_voice_router(
     """Build the ``/voice/ws`` router. ``pipeline`` is the text turn generator."""
     refresh_flags()
     router = APIRouter()
-    do_mask = MASK_ENABLED if mask_enabled is None else mask_enabled
     tracer = get_tracer()
+
+    def _is_mask_enabled() -> bool:
+        if mask_enabled is None:
+            return _flag("MASK", "true")
+        if callable(mask_enabled):
+            return bool(mask_enabled())
+        return bool(mask_enabled)
 
     @router.get("/voice/ui.js", include_in_schema=False)
     def ui_js():
@@ -129,6 +144,7 @@ def make_voice_router(
         mask_override: bool | None = None
         stt_acc = {"in": 0, "out": 0}
         stt_time = {"sec": 0.0}
+        stt_measured = {"val": True}
         agent_task: asyncio.Task | None = None
         settle_task: asyncio.Task | None = None
         stt_lock = asyncio.Lock()
@@ -151,10 +167,12 @@ def make_voice_router(
             pending = ""
             stt_acc["in"] = stt_acc["out"] = 0
             stt_time["sec"] = 0.0
+            stt_measured["val"] = True
 
         async def run_agent(text: str, turn_mode: str) -> None:
             nonlocal pending
             quick = turn_mode == "quick"
+            do_mask = _is_mask_enabled()
             turn_stream = True
             turn_mask = (
                 (bool(mask_override) and do_mask)
@@ -163,6 +181,7 @@ def make_voice_router(
             )
             turn_judge = bool(judge_override) if judge_override is not None else (not quick)
             answer_text = ""
+            clean_text = text
             timing: dict[str, float] = {}
             agent_tok = {"in": 0, "out": 0}
             judge_tok = {"in": 0, "out": 0}
@@ -172,17 +191,17 @@ def make_voice_router(
             audio_bytes = {"n": 0}
 
             def clock(stage: str, t0: float) -> None:
-                timing[stage] = round(time.perf_counter() - t0, 2)
+                timing[stage] = round(time.perf_counter() - t0, 3)
 
             def mark(name: str) -> None:
-                timing[name] = round(time.perf_counter() - turn_t0, 2)
+                timing[name] = round(time.perf_counter() - turn_t0, 3)
 
             async def send_cost() -> None:
                 all_stages = {
                     "stt": {
                         **stt_acc,
                         "usd": cost.usd("stt", stt_acc["in"], stt_acc["out"]),
-                        "measured": True,
+                        "measured": stt_measured["val"],
                     },
                     "judge": {
                         **judge_tok,
@@ -221,6 +240,31 @@ def make_voice_router(
                         await send_bytes(chunk[offset : offset + _AUDIO_CHUNK])
                     mark("tts_end")
 
+            async def speak_redirect(redirect_text: str, first: list) -> None:
+                cache_key = (id(synthesize_stream), TTS_MODEL, TTS_VOICE, redirect_text)
+                cached = _REDIRECT_PCM_CACHE.get(cache_key)
+                if cached:
+                    if not first:
+                        first.append(_ms(tts_t0))
+                        mark("tts_start")
+                    audio_bytes["n"] += len(cached)
+                    for offset in range(0, len(cached), _AUDIO_CHUNK):
+                        await send_bytes(cached[offset : offset + _AUDIO_CHUNK])
+                    mark("tts_end")
+                    return
+                chunks: list[bytes] = []
+                async for chunk in synthesize_stream(redirect_text, usage_out=tts_tok):
+                    if not first:
+                        first.append(_ms(tts_t0))
+                        mark("tts_start")
+                    chunks.append(chunk)
+                    audio_bytes["n"] += len(chunk)
+                    for offset in range(0, len(chunk), _AUDIO_CHUNK):
+                        await send_bytes(chunk[offset : offset + _AUDIO_CHUNK])
+                    mark("tts_end")
+                if chunks:
+                    _REDIRECT_PCM_CACHE[cache_key] = b"".join(chunks)
+
             def tts_step(first: list, chars: int) -> dict:
                 seconds = audio_bytes["n"] / _BYTES_PER_SEC
                 detail = f"spoke {chars:,} characters as {seconds:.1f} s of audio"
@@ -253,6 +297,8 @@ def make_voice_router(
                 await send_json({"type": "processing"})
                 turn_t0 = time.perf_counter()
                 trace = trace_url(span) if trace_url else None
+                if inspect.isawaitable(trace):
+                    trace = await trace
                 if trace:
                     await send_json({"type": "trace", "span": "voice.turn", **trace})
 
@@ -268,21 +314,36 @@ def make_voice_router(
                 sentence_buf = ""
                 shown = ""
                 masked_once = False
+                mask_elapsed_sec = 0.0
+                mask_in_chars = 0
+                mask_out_chars = 0
 
                 async def speak_masked(segment: str) -> None:
                     nonlocal shown, masked_once, tts_t0, tts_queue, worker, pending
-                    text = segment.strip()
-                    if not text:
+                    nonlocal mask_elapsed_sec, mask_in_chars, mask_out_chars
+                    seg = segment.strip()
+                    if not seg:
                         return
-                    if mask_text is None:
-                        spoken, note = text, "response unchanged"
-                    else:
-                        spoken, note = await mask_text(text)
-                        spoken = spoken or text
+                    if not masked_once:
+                        await send_json({"type": "stage", "key": "mask", "stage": "A2A Data Masker"})
+                    seg_t0 = time.perf_counter()
+                    with tracer.start_as_current_span("security.a2a_mask") as mspan:
+                        mspan.set_attribute(ATTR.OPENINFERENCE_SPAN_KIND, "GUARDRAIL")
+                        mspan.set_attribute(ATTR.INPUT_VALUE, seg[:500])
+                        if mask_text is None:
+                            spoken, note = seg, "response unchanged"
+                        else:
+                            spoken, note = await mask_text(seg)
+                            spoken = spoken or seg
+                        mspan.set_attribute(ATTR.OUTPUT_VALUE, spoken[:500])
+                    mask_elapsed_sec += time.perf_counter() - seg_t0
+                    mask_in_chars += len(seg)
+                    mask_out_chars += len(spoken)
+                    timing["mask"] = round(mask_elapsed_sec, 3)
+                    mask_tok["in"] = max(1, mask_in_chars // 4)
+                    mask_tok["out"] = max(1, mask_out_chars // 4)
                     if not masked_once:
                         masked_once = True
-                        mask_t0 = time.perf_counter()
-                        await send_json({"type": "stage", "key": "mask", "stage": "A2A Data Masker"})
                         await send_json(
                             {
                                 "type": "step",
@@ -291,11 +352,12 @@ def make_voice_router(
                                 "status": "passed",
                                 "detail": note,
                                 "span": "security.a2a_mask",
-                                "ms": 1,
+                                "ms": int(round(mask_elapsed_sec * 1000)),
                                 "kind": "A2A",
+                                "in_chars": mask_in_chars,
+                                "out_chars": mask_out_chars,
                             }
                         )
-                        clock("mask", mask_t0)
                     shown = f"{shown} {spoken}".strip() if shown else spoken
                     if tts_queue is None:
                         pending = ""
@@ -315,7 +377,7 @@ def make_voice_router(
                     added = full[len(raw_seen) :] if full.startswith(raw_seen) else full
                     raw_seen = full
                     sentence_buf += added
-                    head, sentence_buf = _take_complete(sentence_buf)
+                    head, sentence_buf = _take_complete(sentence_buf, mask=True)
                     if head.strip():
                         await speak_masked(head)
 
@@ -351,7 +413,9 @@ def make_voice_router(
                             elif event["key"] == "agent" and "agent_start" not in timing:
                                 mark("agent_start")
                         elif kind == "step":
-                            if event["key"] == "judge" and judge_t0:
+                            if event["key"] == "sanitize" and event.get("clean_text"):
+                                clean_text = event["clean_text"]
+                            elif event["key"] == "judge" and judge_t0:
                                 clock("judge", judge_t0)
                                 judge_tok["in"] = max(1, event.get("text_chars", len(text)) // 4)
                                 judge_tok["out"] = 4
@@ -394,6 +458,12 @@ def make_voice_router(
                                 head, tts_buffer = _take_complete(tts_buffer)
                                 if head.strip() and tts_queue is not None:
                                     tts_queue.put_nowait(head)
+                        elif kind == "error":
+                            msg = event.get("error") or event.get("message") or "Pipeline error."
+                            await send_json({"type": "error", "message": msg, "error": msg})
+                            await send_json({"type": "turn_end"})
+                            reset_query()
+                            return
                         elif kind == "final":
                             if event["blocked"]:
                                 blocked = event
@@ -412,13 +482,21 @@ def make_voice_router(
                         await send_json(event)
 
                     if blocked:
-                        await send_json(
-                            {
-                                "type": "blocked",
-                                "stage": blocked["stage"],
-                                "response": blocked["response"],
-                            }
-                        )
+                        blocked_payload = {
+                            "type": "blocked",
+                            "stage": blocked["stage"],
+                            "response": blocked["response"],
+                        }
+                        if blocked.get("reason") is not None:
+                            blocked_payload["reason"] = blocked["reason"]
+                        await send_json(blocked_payload)
+                        if blocked.get("reason") == "off_topic" and blocked.get("response"):
+                            redirect_text = str(blocked["response"])
+                            pending = ""
+                            tts_t0 = time.perf_counter()
+                            await send_json({"type": "stage", "key": "tts", "stage": "Speaking"})
+                            await speak_redirect(redirect_text, first_audio)
+                            await send_json(tts_step(first_audio, len(redirect_text)))
                         await send_json({"type": "turn_end"})
                         reset_query()
                         return
@@ -449,7 +527,8 @@ def make_voice_router(
                         await send_json({"type": "stage", "key": "tts", "stage": "Speaking"})
                         await speak(display, first_audio)
                         await send_json(tts_step(first_audio, len(display)))
-                    answer_text = display.strip()
+                    answer_text = (shown if turn_mask and shown else display).strip()
+                    span.set_attribute(ATTR.OUTPUT_VALUE, answer_text)
                 finally:
                     if worker is not None and not worker.done():
                         worker.cancel()
@@ -459,12 +538,12 @@ def make_voice_router(
                             pass
 
                 answer_sec = time.perf_counter() - turn_t0
-                timing["stt"] = round(stt_time["sec"], 2)
-                timing["total_response"] = round(stt_time["sec"] + answer_sec, 2)
+                timing["stt"] = round(stt_time["sec"], 3)
+                timing["total_response"] = round(stt_time["sec"] + answer_sec, 3)
                 await send_json({"type": "timing", "stages": timing})
                 await send_cost()
                 if record and answer_text:
-                    record(user_id, "user", text)
+                    record(user_id, "user", clean_text)
                     record(user_id, "assistant", answer_text)
                 await send_json({"type": "turn_end"})
                 reset_query()
@@ -619,7 +698,11 @@ def make_voice_router(
                 elif commit:
                     await send_json({"type": "turn_end", "reason": "empty"})
                 return
+            usage_in, usage_out = cost.usage_tokens(stt_usage)
+            has_usage = bool(usage_in or usage_out)
             tokens_in, tokens_out = cost.stt_charge(stt_usage, pcm_bytes)
+            if (tokens_in or tokens_out) and not has_usage:
+                stt_measured["val"] = False
             audio_sec = pcm_bytes / 32000
             extra = f"{tokens_in:,} in / {tokens_out:,} out tokens" if tokens_in or tokens_out else None
             await send_json(
@@ -666,15 +749,23 @@ def make_voice_router(
                         continue
                     if data.get("type") == "mode":
                         connection_mode = normalize_demo_mode(data.get("mode"))
-                        if "judge" in data and data["judge"] is not None:
-                            judge_override = bool(data["judge"])
-                        if "mask" in data and data["mask"] is not None:
-                            mask_override = bool(data["mask"])
+                        if "judge" in data:
+                            judge_override = (
+                                None if data["judge"] is None else bool(data["judge"])
+                            )
+                        if "mask" in data:
+                            mask_override = (
+                                None if data["mask"] is None else bool(data["mask"])
+                            )
                     elif data.get("type") == "guardrails":
-                        if "judge" in data and data["judge"] is not None:
-                            judge_override = bool(data["judge"])
-                        if "mask" in data and data["mask"] is not None:
-                            mask_override = bool(data["mask"])
+                        if "judge" in data:
+                            judge_override = (
+                                None if data["judge"] is None else bool(data["judge"])
+                            )
+                        if "mask" in data:
+                            mask_override = (
+                                None if data["mask"] is None else bool(data["mask"])
+                            )
                     elif data.get("type") == "utterance_end":
                         await on_utterance_end(commit=bool(data.get("commit")))
                     elif data.get("type") == "interrupt":

@@ -78,6 +78,21 @@ def test_theme_toggle_dark_and_light():
         assert 'id="themeToggle"' in html
         assert "localStorage['cs-theme']" in html
         assert "applyTheme(localStorage['cs-theme']||'light')" in html
+        assert "window.addEventListener('storage'" in html
+        assert "e.key==='cs-theme'" in html
+
+
+def test_index_pill_hover_override_and_aurora_outside_login():
+    html = client.get("/").text
+    assert ".steps summary .pill:hover:not(:disabled){transform:none}" in html
+    assert '<div id="loginScreen">' in html
+    # Aurora and grain sit inside #loginScreen BEFORE <div class="login" id="login">
+    screen_idx = html.index('<div id="loginScreen">')
+    aurora_idx = html.index('<div class="ds-aurora"', screen_idx)
+    grain_idx = html.index('<div class="ds-grain"', screen_idx)
+    login_idx = html.index('<div class="login" id="login">', screen_idx)
+    assert screen_idx < aurora_idx < grain_idx < login_idx
+    assert "document.getElementById('loginScreen')" in html
 
 
 def test_tab_hold_prevents_default_on_repeat():

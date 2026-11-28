@@ -15,17 +15,8 @@ from google.genai import types
 
 from src.core.telemetry import ATTR, get_tracer
 
-STT_MODEL = os.getenv("VOICE_STT_MODEL", "gemini-3.1-flash-lite")
 LIVE_STT_MODEL = os.getenv("VOICE_STT_LIVE_MODEL", "gemini-3.1-flash-live-preview")
 _PCM_MIME = "audio/pcm;rate=16000"
-
-_TRANSCRIBE_PROMPT = (
-    "You are a speech-to-text engine. Transcribe ONLY the words the speaker says. "
-    "Rules: output plain text of the spoken words and nothing else. Do NOT add "
-    "timestamps, time codes, WEBVTT/SRT cue markers, speaker labels, brackets, or "
-    "any commentary. If the audio contains no clear, intelligible speech, respond "
-    "with exactly the token NO_SPEECH and nothing else."
-)
 
 _VTT_ARROW = re.compile(
     r"\d{1,2}:\d{2}(?::\d{2})?[.,:]?\d*\s*-->\s*\d{1,2}:\d{2}(?::\d{2})?[.,:]?\d*"
@@ -69,28 +60,6 @@ def pcm16_to_wav(pcm: bytes, sample_rate: int = 16000) -> bytes:
     return buffer.getvalue()
 
 
-async def transcribe(pcm: bytes, sample_rate: int = 16000):
-    """Return ``(transcript, usage_metadata)`` for one PCM utterance."""
-    wav = pcm16_to_wav(pcm, sample_rate)
-    with get_tracer().start_as_current_span("stt") as span:
-        span.set_attribute(ATTR.OPENINFERENCE_SPAN_KIND, "VOICE")
-        span.set_attribute("voice.stage", "stt")
-        span.set_attribute("voice.model", STT_MODEL)
-        response = await _client().aio.models.generate_content(
-            model=STT_MODEL,
-            contents=[
-                types.Content(
-                    role="user",
-                    parts=[
-                        types.Part.from_bytes(data=wav, mime_type="audio/wav"),
-                        types.Part(text=_TRANSCRIBE_PROMPT),
-                    ],
-                )
-            ],
-        )
-    return _clean(response.text or ""), getattr(response, "usage_metadata", None)
-
-
 def live_model() -> str:
     """Live transcription model. Override with ``VOICE_STT_LIVE_MODEL``."""
     return os.getenv("VOICE_STT_LIVE_MODEL", LIVE_STT_MODEL)
@@ -111,7 +80,7 @@ def _live_config() -> types.LiveConnectConfig:
 
 
 _FLUSH_DRAIN_SEC = 0.25
-_BURST_FLUSH_WAIT_SEC = 3.0
+_INTERIM_FINALIZE_SEC = 0.7
 _END_SILENCE_PCM = b"\x00" * 32000  # 1.0 s of 16 kHz mono 16-bit PCM silence for Live VAD
 
 
@@ -251,16 +220,13 @@ class LiveUtterance:
         await self._end_audio(pad_silence=pad_silence)
         loop = asyncio.get_running_loop()
         start = loop.time()
-        if phrase_bytes < 3200:
-            max_wait = _FLUSH_DRAIN_SEC
-        elif pad_silence:
-            max_wait = _BURST_FLUSH_WAIT_SEC
-        else:
-            max_wait = 0.7
+        max_wait = _INTERIM_FINALIZE_SEC if self._new_piece() else _FLUSH_DRAIN_SEC
         deadline = start + max_wait
         while loop.time() < deadline:
             piece = self._new_piece()
             if piece:
+                if deadline < start + _INTERIM_FINALIZE_SEC:
+                    deadline = start + _INTERIM_FINALIZE_SEC
                 if self._turn_done:
                     break
                 if self._seq > seq_before and (time.monotonic() - self._last_rx) >= 0.2:

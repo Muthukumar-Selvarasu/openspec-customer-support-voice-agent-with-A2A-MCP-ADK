@@ -479,7 +479,131 @@ def test_guardrails_toggles_override_judge_and_mask_in_both_explain_and_quick(we
         "mask": False,
         "stream": True,
     }
+    # Quick mode respects stream_endpoint=False (non-streaming /api/chat)
     web._guardrails.clear()
+    assert web.demo_pipeline_kwargs("quick", stream_endpoint=False, user_id=USER) == {
+        "judge": False,
+        "mask": False,
+        "stream": False,
+    }
+
+    # Partial update preserves omitted field; explicit null clears override
+    client.post("/api/guardrails", json={"user_id": USER, "judge": True, "mask": True})
+    r_partial = client.post("/api/guardrails", json={"user_id": USER, "judge": False})
+    assert r_partial.json() == {"ok": True, "judge": False, "mask": True}
+    r_clear_one = client.post("/api/guardrails", json={"user_id": USER, "judge": None})
+    assert r_clear_one.json() == {"ok": True, "mask": True}
+    assert web._guardrails[USER] == {"mask": True}
+    r_clear_all = client.post("/api/guardrails", json={"user_id": USER, "mask": None})
+    assert r_clear_all.json() == {"ok": True}
+    assert USER not in web._guardrails
+    web._guardrails.clear()
+
+
+def test_guardrails_cleared_on_login_and_flush_and_not_pushed_by_default(web, monkeypatch) -> None:
+    import asyncio
+    from fastapi.testclient import TestClient
+
+    web._guardrails[USER] = {"judge": True, "mask": True}
+    asyncio.run(web._flush_shopper(USER))
+    assert USER not in web._guardrails
+
+    web._guardrails[USER] = {"judge": True, "mask": True}
+    monkeypatch.setattr(
+        web,
+        "authenticate_user",
+        lambda email, password: {
+            "user_id": 1,
+            "email": USER,
+            "full_name": "Alice Jones",
+            "is_premium_customer": True,
+            "total_items_purchased": 5,
+        },
+    )
+    monkeypatch.setattr(web, "get_database_tools", lambda: [])
+    client = TestClient(web.app)
+    resp = client.post("/api/login", json={"email": USER, "password": "alice"})
+    assert resp.status_code == 200
+    assert USER not in web._guardrails
+
+    # Client-side JS: fresh login & WS open do NOT push overrides; reload with explicit choice DOES;
+    # setDemoMode resets explicit overrides cleanly.
+    html = INDEX.read_text(encoding="utf-8")
+    voice = VOICE_UI.read_text(encoding="utf-8")
+    script = "\n".join(
+        [
+            "const bag = {};",
+            "globalThis.localStorage = new Proxy(bag, {",
+            "  get(target, prop) { return target[prop]; },",
+            "  set(target, prop, value) { target[prop] = value; return true; },",
+            "  deleteProperty(target, prop) { delete target[prop]; return true; },",
+            "});",
+            "function button(){ const classes = new Set(); return { classes, attrs: {}, textContent: '',",
+            "  classList: { toggle(name, on){ if(on) classes.add(name); else classes.delete(name); } },",
+            "  setAttribute(key, value){ this.attrs[key] = value; } }; }",
+            "const buttons = { modeExplain: button(), modeQuick: button(), toggleJudge: button(), toggleMask: button() };",
+            "globalThis.document = { getElementById(id){ return buttons[id]; } };",
+            "globalThis.window = globalThis;",
+            "var USER = 'alice.jones@example.com';",
+            "const fetches = [];",
+            "globalThis.fetch = (url, opts) => { fetches.push({ url, body: JSON.parse(opts.body) }); return Promise.resolve({ ok: true }); };",
+            "const wsSent = [];",
+            "let ws = { readyState: 1, send(body) { wsSent.push(JSON.parse(body)); } };",
+            _extract_function(html, "function demoMode("),
+            _extract_function(html, "function applyDemoMode("),
+            _extract_function(html, "function setDemoMode("),
+            _extract_function(html, "function explicitGuardrails("),
+            _extract_function(html, "function judgeEnabled("),
+            _extract_function(html, "function maskEnabled("),
+            _extract_function(html, "function applyGuardrails("),
+            _extract_function(html, "function syncGuardrails("),
+            _extract_function(voice, "function sendDemoMode("),
+            _extract_function(voice, "function sendGuardrails("),
+            "window.csSendDemoMode = sendDemoMode;",
+            "window.csSendGuardrails = sendGuardrails;",
+            "// 1. Fresh login + WS open with no explicit overrides sends nothing",
+            "syncGuardrails();",
+            "sendGuardrails();",
+            "const freshFetches = fetches.slice();",
+            "const freshWs = wsSent.slice();",
+            "// 2. Explicit user override persists and syncs on reload / WS open",
+            "localStorage['cs-judge'] = 'off';",
+            "syncGuardrails();",
+            "const afterExplicitFetches = fetches.slice();",
+            "const afterExplicitWs = wsSent.slice();",
+            "// 3. Switching to quick clears overrides and updates visuals to OFF",
+            "fetches.length = 0; wsSent.length = 0;",
+            "setDemoMode('quick');",
+            "const afterSwitch = {",
+            "  csJudge: localStorage['cs-judge'] ?? null,",
+            "  csMask: localStorage['cs-mask'] ?? null,",
+            "  judgeText: buttons.toggleJudge.textContent,",
+            "  maskText: buttons.toggleMask.textContent,",
+            "  fetches: fetches.slice(),",
+            "  ws: wsSent.slice(),",
+            "};",
+            "console.log(JSON.stringify({ freshFetches, freshWs, afterExplicitFetches, afterExplicitWs, afterSwitch }));",
+        ]
+    )
+    proc = subprocess.run(["node", "-"], input=script, text=True, capture_output=True, check=False)
+    assert proc.returncode == 0, proc.stderr
+    result = json.loads(proc.stdout)
+    assert result["freshFetches"] == []
+    assert result["freshWs"] == []
+    assert result["afterExplicitFetches"] == [
+        {"url": "/api/guardrails", "body": {"user_id": USER, "judge": False}}
+    ]
+    assert result["afterExplicitWs"] == [{"type": "guardrails", "judge": False}]
+    assert result["afterSwitch"]["csJudge"] is None
+    assert result["afterSwitch"]["csMask"] is None
+    assert result["afterSwitch"]["judgeText"] == "Judge: OFF"
+    assert result["afterSwitch"]["maskText"] == "Masker: OFF"
+    assert result["afterSwitch"]["fetches"] == [
+        {"url": "/api/guardrails", "body": {"user_id": USER, "judge": None, "mask": None}}
+    ]
+    assert result["afterSwitch"]["ws"] == [
+        {"type": "mode", "mode": "quick", "judge": None, "mask": None}
+    ]
 
 
 async def test_parallel_judge_and_agent_cancels_agent_on_block(web, monkeypatch) -> None:
@@ -585,3 +709,94 @@ def test_what_happened_orders_stt_first_and_llm_before_tts() -> None:
     proc = subprocess.run(["node", "-"], input=script, text=True, capture_output=True, check=False)
     assert proc.returncode == 0, proc.stderr
     assert json.loads(proc.stdout) == ["stt", "sanitize", "llm", "mask", "tts"]
+
+
+def test_chat_and_chat_stream_record_sanitized_user_text(web, monkeypatch) -> None:
+    from fastapi.testclient import TestClient
+
+    async def judge(text: str) -> tuple[bool, str]:
+        return True, "ALLOW"
+
+    async def mask(text: str) -> tuple[str, str]:
+        return text, "no PII found, response unchanged"
+
+    monkeypatch.setattr(web, "_judge", judge)
+    monkeypatch.setattr(web, "_mask", mask)
+    web._runners.clear()
+    web._transcripts.clear()
+    web._runners[USER] = _FakeRunner()
+    client = TestClient(web.app)
+
+    r_chat = client.post(
+        "/api/chat",
+        json={"user_id": USER, "message": "Status of order #5?", "mode": "quick"},
+    )
+    assert r_chat.status_code == 200
+    assert web._transcripts[USER][0] == {"role": "user", "content": "Status of order 5?"}
+
+    web._transcripts.clear()
+    r_stream = client.post(
+        "/api/chat/stream",
+        json={"user_id": USER, "message": "Status of order #7?", "mode": "quick"},
+    )
+    assert r_stream.status_code == 200
+    assert web._transcripts[USER][0] == {"role": "user", "content": "Status of order 7?"}
+
+
+async def test_resolve_trace_url_uses_cooldown_fallback_and_passes_api_key(web, monkeypatch) -> None:
+    import io
+    import threading
+    from types import SimpleNamespace
+
+    monkeypatch.setenv("TELEMETRY", "true")
+    monkeypatch.setenv("PHOENIX_URL", "http://phoenix.internal:6006")
+    monkeypatch.setenv("PHOENIX_PUBLIC_URL", "https://phoenix.public")
+    monkeypatch.delenv("PHOENIX_API_KEY", raising=False)
+    monkeypatch.setattr(web, "_phoenix_project", None)
+    monkeypatch.setattr(web, "_phoenix_failed_until", 0.0)
+
+    span = SimpleNamespace(get_span_context=lambda: SimpleNamespace(trace_id=0xABC))
+    calls: list[dict] = []
+    main_tid = threading.get_ident()
+
+    def failing_urlopen(req, timeout=2):
+        calls.append({"thread": threading.get_ident(), "headers": dict(req.header_items())})
+        raise OSError("phoenix down")
+
+    monkeypatch.setattr(web.urllib.request, "urlopen", failing_urlopen)
+
+    first = await web.resolve_trace_url(span)
+    second = await web.resolve_trace_url(span)
+    assert first == {"trace_id": f"{0xABC:032x}", "url": "https://phoenix.public/projects"}
+    assert second == first
+    # Offloaded to a worker thread and second call hit the cooldown without another HTTP call
+    assert len(calls) == 1
+    assert calls[0]["thread"] != main_tid
+
+    # Reset cooldown and verify Authorization: Bearer <PHOENIX_API_KEY> header is sent when set
+    monkeypatch.setattr(web, "_phoenix_project", None)
+    monkeypatch.setattr(web, "_phoenix_failed_until", 0.0)
+    monkeypatch.setenv("PHOENIX_API_KEY", "phx-secret-key")
+    auth_seen: list[str | None] = []
+
+    class _Resp:
+        def __enter__(self):
+            return io.StringIO('{"data": [{"id": "proj-42", "name": "default"}]}')
+
+        def __exit__(self, *args):
+            return False
+
+    def ok_urlopen(req, timeout=2):
+        auth_seen.append(req.get_header("Authorization"))
+        return _Resp()
+
+    monkeypatch.setattr(web.urllib.request, "urlopen", ok_urlopen)
+    linked = await web.resolve_trace_url(span)
+    assert auth_seen == ["Bearer phx-secret-key"]
+    assert linked == {
+        "trace_id": f"{0xABC:032x}",
+        "url": f"https://phoenix.public/projects/proj-42/traces/{0xABC:032x}",
+    }
+    # Clean up cached module global for subsequent tests
+    monkeypatch.setattr(web, "_phoenix_project", None)
+    monkeypatch.setattr(web, "_phoenix_failed_until", 0.0)

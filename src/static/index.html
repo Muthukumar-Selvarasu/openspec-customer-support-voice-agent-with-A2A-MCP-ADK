@@ -34,7 +34,8 @@
        display:flex;align-items:center;gap:6px}
   .steps summary::-webkit-details-marker{display:none}
   .steps summary .pill{display:inline-block;background:var(--paper);border:1px solid var(--line);box-shadow:none;
-       border-radius:999px;padding:1px 9px;margin-left:6px;font-size:12px;color:var(--teal);font-weight:600}
+       border-radius:999px;padding:1px 9px;margin-left:6px;font-size:12px;color:var(--teal);font-weight:600;transform:none}
+  .steps summary .pill:hover:not(:disabled){transform:none}
   .steps .trace-link{margin-left:auto;color:var(--teal);text-decoration:none;font-weight:600}
   .steps .trace-link:hover{text-decoration:underline;color:var(--teal-deep)}
   .step{padding:10px 14px;border-top:1px solid var(--line);font-size:13px}
@@ -157,19 +158,21 @@
 
 <main>
   <div class="col" id="col">
-    <div class="login" id="login">
+    <div id="loginScreen">
       <div class="ds-aurora" aria-hidden="true"></div>
       <div class="ds-grain" aria-hidden="true"></div>
-      <p class="ds-eyebrow">Customer support</p>
-      <h2>Sign in to <em class="ds-serif-em">continue.</em></h2>
-      <p>Use a seeded demo account. Password is the first name, lowercase.</p>
-      <input id="email" placeholder="email" value="alice.jones@example.com" autocomplete="off"/>
-      <input id="password" placeholder="password" type="password" value="alice"/>
-      <button type="button" id="loginBtn" class="pill">Sign in</button>
-      <div class="err" id="loginErr"></div>
-      <div class="seed">Try: <code>alice.jones@example.com</code> / <code>alice</code> ·
-        <code>bob.smith@techmail.com</code> / <code>bob</code> ·
-        <code>julia.child@kitchen.com</code> / <code>julia</code></div>
+      <div class="login" id="login">
+        <p class="ds-eyebrow">Customer support</p>
+        <h2>Sign in to <em class="ds-serif-em">continue.</em></h2>
+        <p>Use a seeded demo account. Password is the first name, lowercase.</p>
+        <input id="email" placeholder="email" value="alice.jones@example.com" autocomplete="off"/>
+        <input id="password" placeholder="password" type="password" value="alice"/>
+        <button type="button" id="loginBtn" class="pill">Sign in</button>
+        <div class="err" id="loginErr"></div>
+        <div class="seed">Try: <code>alice.jones@example.com</code> / <code>alice</code> ·
+          <code>bob.smith@techmail.com</code> / <code>bob</code> ·
+          <code>julia.child@kitchen.com</code> / <code>julia</code></div>
+      </div>
     </div>
   </div>
 </main>
@@ -223,18 +226,42 @@ function applyDemoMode(mode){
 }
 function setDemoMode(mode){
   const next=mode==="quick"?"quick":"explain";
+  const hadOverrides=localStorage["cs-judge"]!=null||localStorage["cs-mask"]!=null;
   localStorage["cs-demo-mode"]=next;
+  if(typeof localStorage.removeItem==="function"){
+    localStorage.removeItem("cs-judge");
+    localStorage.removeItem("cs-mask");
+  }else{
+    delete localStorage["cs-judge"];
+    delete localStorage["cs-mask"];
+  }
   applyDemoMode(next);
-  if(window.csSendDemoMode) window.csSendDemoMode();
+  if(typeof applyGuardrails==="function") applyGuardrails();
+  if(window.csSendDemoMode) window.csSendDemoMode(hadOverrides);
+  let uid=null; try{ uid=USER; }catch(e){}
+  if(uid&&typeof fetch==="function"){
+    fetch('/api/guardrails',{method:'POST',headers:{'content-type':'application/json'},
+      body:JSON.stringify({user_id:uid, judge:null, mask:null})}).catch(()=>{});
+  }
 }
 applyDemoMode(demoMode());
 document.getElementById("modeExplain").onclick=()=>setDemoMode("explain");
 document.getElementById("modeQuick").onclick=()=>setDemoMode("quick");
+function explicitGuardrails(){
+  const out={};
+  if(localStorage["cs-judge"]==="on"||localStorage["cs-judge"]==="off") out.judge=localStorage["cs-judge"]==="on";
+  if(localStorage["cs-mask"]==="on"||localStorage["cs-mask"]==="off") out.mask=localStorage["cs-mask"]==="on";
+  return out;
+}
 function judgeEnabled(){
-  return localStorage["cs-judge"]!=="off";
+  if(localStorage["cs-judge"]==="on") return true;
+  if(localStorage["cs-judge"]==="off") return false;
+  return demoMode()!=="quick";
 }
 function maskEnabled(){
-  return localStorage["cs-mask"]!=="off";
+  if(localStorage["cs-mask"]==="on") return true;
+  if(localStorage["cs-mask"]==="off") return false;
+  return demoMode()!=="quick";
 }
 function applyGuardrails(){
   const j=judgeEnabled(), m=maskEnabled();
@@ -253,10 +280,12 @@ function applyGuardrails(){
 }
 function syncGuardrails(){
   applyGuardrails();
+  const overrides=explicitGuardrails();
+  if(!Object.keys(overrides).length) return;
   if(window.csSendGuardrails) window.csSendGuardrails();
-  if(USER&&typeof fetch==="function"){
+  if(typeof USER!=="undefined"&&USER&&typeof fetch==="function"){
     fetch('/api/guardrails',{method:'POST',headers:{'content-type':'application/json'},
-      body:JSON.stringify({user_id:USER, judge:judgeEnabled(), mask:maskEnabled()})}).catch(()=>{});
+      body:JSON.stringify({user_id:USER, ...overrides})}).catch(()=>{});
   }
 }
 applyGuardrails();
@@ -456,6 +485,8 @@ function newEpoch(){
 function enterShop(d){
   USER=d.user_id;
   who.textContent=`${d.full_name||''}${d.is_premium?' · premium':''}${d.model?' · '+d.model:''}`;
+  const loginScreen=document.getElementById('loginScreen');
+  if(loginScreen) loginScreen.remove();
   const loginEl=document.getElementById('login');
   if(loginEl) loginEl.remove();
   document.getElementById('demoMode').style.display='flex';
@@ -599,6 +630,7 @@ document.getElementById('themeToggle').onclick=()=>{
   localStorage['cs-theme']=next;
   applyTheme(next);
 };
+window.addEventListener('storage',(e)=>{if(e.key==='cs-theme')applyTheme(e.newValue||'light');});
 </script>
 <script src="/voice/ui.js"></script>
 </body>

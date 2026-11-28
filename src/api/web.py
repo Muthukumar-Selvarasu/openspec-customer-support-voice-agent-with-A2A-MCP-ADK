@@ -163,7 +163,7 @@ def demo_pipeline_kwargs(
         else (False if quick else mask_enabled())
     )
     if quick and judge is None and mask is None:
-        return {"judge": False, "mask": False, "stream": True}
+        return {"judge": False, "mask": False, "stream": stream_endpoint}
     return {
         "judge": do_judge,
         "mask": do_mask,
@@ -315,6 +315,7 @@ def _seal_epoch(user_id: str) -> None:
 
 async def _flush_shopper(user_id: str) -> None:
     _runners.pop(user_id, None)
+    _guardrails.pop(user_id, None)
     messages = _transcripts.pop(user_id, None)
     if messages:
         try:
@@ -433,27 +434,68 @@ async def _mask(text: str) -> tuple[str, str]:
     return out, note
 
 
-_phoenix_project = None
+_phoenix_project: str | None = None
+_phoenix_failed_until: float = 0.0
+_PHOENIX_FAIL_COOLDOWN_SEC = 30.0
+
+
+def _fetch_phoenix_project_id(phoenix_url: str) -> str | None:
+    global _phoenix_project, _phoenix_failed_until
+    if _phoenix_project is not None:
+        return _phoenix_project
+    if time.monotonic() < _phoenix_failed_until:
+        return None
+    headers: dict[str, str] = {}
+    api_key = os.getenv("PHOENIX_API_KEY", "").strip()
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    req = urllib.request.Request(f"{phoenix_url}/v1/projects", headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=2) as response:
+            projects = json.load(response)["data"]
+        _phoenix_project = next(item["id"] for item in projects if item["name"] == "default")
+        return _phoenix_project
+    except Exception:
+        _phoenix_failed_until = time.monotonic() + _PHOENIX_FAIL_COOLDOWN_SEC
+        return None
 
 
 def trace_url(span) -> dict | None:
     """Phoenix deep link for a real span. None when telemetry is off."""
     if not telemetry_enabled() or not hasattr(span, "get_span_context"):
         return None
-    global _phoenix_project
     settings = resolve_service_settings()
     trace_id = format(span.get_span_context().trace_id, "032x")
     public = settings.phoenix_public_url
-    if _phoenix_project is None:
-        try:
-            with urllib.request.urlopen(f"{settings.phoenix_url}/v1/projects", timeout=2) as response:
-                projects = json.load(response)["data"]
-            _phoenix_project = next(item["id"] for item in projects if item["name"] == "default")
-        except Exception:
-            return {"trace_id": trace_id, "url": f"{public}/projects"}
+    project_id = _fetch_phoenix_project_id(settings.phoenix_url)
+    if project_id is None:
+        return {"trace_id": trace_id, "url": f"{public}/projects"}
     return {
         "trace_id": trace_id,
-        "url": f"{public}/projects/{_phoenix_project}/traces/{trace_id}",
+        "url": f"{public}/projects/{project_id}/traces/{trace_id}",
+    }
+
+
+async def resolve_trace_url(span) -> dict | None:
+    """Async Phoenix deep-link lookup that never blocks the asyncio event loop."""
+    if not telemetry_enabled() or not hasattr(span, "get_span_context"):
+        return None
+    settings = resolve_service_settings()
+    trace_id = format(span.get_span_context().trace_id, "032x")
+    public = settings.phoenix_public_url
+    if _phoenix_project is not None:
+        return {
+            "trace_id": trace_id,
+            "url": f"{public}/projects/{_phoenix_project}/traces/{trace_id}",
+        }
+    if time.monotonic() < _phoenix_failed_until:
+        return {"trace_id": trace_id, "url": f"{public}/projects"}
+    project_id = await asyncio.to_thread(_fetch_phoenix_project_id, settings.phoenix_url)
+    if project_id is None:
+        return {"trace_id": trace_id, "url": f"{public}/projects"}
+    return {
+        "trace_id": trace_id,
+        "url": f"{public}/projects/{project_id}/traces/{trace_id}",
     }
 
 
@@ -505,6 +547,7 @@ async def text_pipeline(
         t0,
         kind="in-process",
         runs="length and character whitelist in src/security/sanitizer.py",
+        **({"clean_text": clean} if clean is not None else {}),
     )
     if clean is None:
         yield blocked("sanitizer", f"Input rejected by sanitizer: {reason}")
@@ -697,7 +740,7 @@ async def text_pipeline(
         )
         final_text = masked
 
-    if turn_span is not None:
+    if turn_span is not None and not (do_mask and stream):
         turn_span.set_attribute(ATTR.OUTPUT_VALUE, final_text)
     yield {"type": "final", "blocked": False, "response": final_text}
 
@@ -744,6 +787,7 @@ async def login(req: LoginReq):
         return JSONResponse({"ok": False, "error": "Invalid email or password."}, status_code=401)
     uid = ctx["email"]
     _seal_epoch(uid)
+    _guardrails.pop(uid, None)
     _runners[uid] = _build_runner(uid)
     _transcripts[uid] = []
     session_id = f"session_{uid}"
@@ -762,6 +806,7 @@ async def login(req: LoginReq):
         "full_name": ctx.get("full_name"),
         "is_premium": bool(ctx.get("is_premium_customer")),
         "items": ctx.get("total_items_purchased", 0),
+        "model": AGENT_MODEL,
     }
 
 
@@ -801,11 +846,21 @@ async def logout(req: LogoutReq):
 
 @app.post("/api/guardrails")
 async def set_guardrails(req: GuardrailsReq):
-    entry = _guardrails.setdefault(req.user_id, {})
-    if req.judge is not None:
-        entry["judge"] = bool(req.judge)
-    if req.mask is not None:
-        entry["mask"] = bool(req.mask)
+    entry = dict(_guardrails.get(req.user_id) or {})
+    if "judge" in req.model_fields_set:
+        if req.judge is None:
+            entry.pop("judge", None)
+        else:
+            entry["judge"] = bool(req.judge)
+    if "mask" in req.model_fields_set:
+        if req.mask is None:
+            entry.pop("mask", None)
+        else:
+            entry["mask"] = bool(req.mask)
+    if entry:
+        _guardrails[req.user_id] = entry
+    else:
+        _guardrails.pop(req.user_id, None)
     return {"ok": True, **entry}
 
 
@@ -815,7 +870,7 @@ async def chat(req: ChatReq):
     if runner is None:
         return JSONResponse({"ok": False, "error": "Not logged in."}, status_code=401)
     turn, span = _turn_span(req.user_id, req.message, "text")
-    tool_calls, out = [], None
+    tool_calls, out, clean_message = [], None, req.message
     try:
         async for event in text_pipeline(
             runner,
@@ -830,7 +885,9 @@ async def chat(req: ChatReq):
                 user_id=req.user_id,
             ),
         ):
-            if event["type"] == "tool_call":
+            if event["type"] == "step" and event.get("key") == "sanitize" and event.get("clean_text"):
+                clean_message = event["clean_text"]
+            elif event["type"] == "tool_call":
                 tool_calls.append({"name": event["name"], "args": event["args"], "result": None})
             elif event["type"] == "tool_result":
                 for call in reversed(tool_calls):
@@ -854,7 +911,7 @@ async def chat(req: ChatReq):
         if "reason" in out:
             resp["reason"] = out["reason"]
         return resp
-    _record(req.user_id, "user", req.message)
+    _record(req.user_id, "user", clean_message)
     _record(req.user_id, "assistant", out["response"])
     return {
         "ok": True,
@@ -872,8 +929,9 @@ async def chat_stream(req: ChatReq):
 
     async def generate():
         turn, span = _turn_span(req.user_id, req.message, "text-stream")
+        clean_message = req.message
         try:
-            linked = trace_url(span)
+            linked = await resolve_trace_url(span)
             if linked:
                 yield json.dumps({"type": "trace", "span": "agent.turn", **linked}) + "\n"
             async for event in text_pipeline(
@@ -889,9 +947,11 @@ async def chat_stream(req: ChatReq):
                     user_id=req.user_id,
                 ),
             ):
+                if event["type"] == "step" and event.get("key") == "sanitize" and event.get("clean_text"):
+                    clean_message = event["clean_text"]
                 yield json.dumps(event, default=str) + "\n"
                 if event["type"] == "final" and not event["blocked"]:
-                    _record(req.user_id, "user", req.message)
+                    _record(req.user_id, "user", clean_message)
                     _record(req.user_id, "assistant", event["response"])
         finally:
             turn.__exit__(None, None, None)
@@ -928,8 +988,8 @@ app.include_router(
         runners=_runners,
         pipeline=text_pipeline,
         record=_record,
-        trace_url=trace_url,
-        mask_enabled=mask_enabled(),
+        trace_url=resolve_trace_url,
+        mask_enabled=mask_enabled,
         mask_text=_mask,
     )
 )

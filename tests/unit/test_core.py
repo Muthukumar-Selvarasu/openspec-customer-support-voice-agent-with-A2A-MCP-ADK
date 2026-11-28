@@ -456,3 +456,127 @@ def test_telemetry_packages_import_cleanly_without_mocking() -> None:
     assert not any(
         name == "phoenix" or name.startswith("phoenix.") for name in newly_imported
     )
+
+
+async def test_cli_mask_false_and_fifo_tool_arg_tracing(monkeypatch: pytest.MonkeyPatch) -> None:
+    import inspect
+    import json
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    import src.api.cli as cli
+
+    mask_calls = {"n": 0}
+    spans: list[tuple[str, dict]] = []
+
+    class FakeSpan:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.attrs: dict = {}
+
+        def set_attribute(self, key: str, value) -> None:
+            self.attrs[key] = value
+
+    class FakeTracer:
+        @contextmanager
+        def start_as_current_span(self, name: str):
+            sp = FakeSpan(name)
+            spans.append((name, sp.attrs))
+            yield sp
+
+    async def fake_validate(text: str) -> str:
+        return text
+
+    async def fake_mask(text: str) -> str:
+        mask_calls["n"] += 1
+        return "[MASKED]"
+
+    monkeypatch.setenv("MASK", "false")
+    monkeypatch.setattr(cli, "get_tracer", lambda: FakeTracer())
+    monkeypatch.setattr(cli, "validate_input", fake_validate)
+    monkeypatch.setattr(cli, "_mask_response", fake_mask)
+
+    class _Fn:
+        def __init__(self, name: str, args=None, response=None) -> None:
+            self.name = name
+            self.args = args
+            self.response = response
+
+    class _Ev:
+        def __init__(self, calls=None, responses=None, text: str | None = None) -> None:
+            self._calls = calls or []
+            self._responses = responses or []
+            self._text = text
+            self.content = SimpleNamespace(parts=[SimpleNamespace(text=text)]) if text is not None else None
+
+        def get_function_calls(self):
+            return self._calls
+
+        def get_function_responses(self):
+            return self._responses
+
+        def is_final_response(self) -> bool:
+            return self._text is not None
+
+    class _Runner:
+        def run(self, **kwargs):
+            return [
+                _Ev(
+                    calls=[
+                        _Fn("get-order-status", {"order_id": 1}),
+                        _Fn("get-order-status", {"order_id": 2}),
+                    ]
+                ),
+                _Ev(
+                    responses=[
+                        _Fn("get-order-status", response={"status": "SHIPPED"}),
+                        _Fn("get-order-status", response={"status": "DELIVERED"}),
+                    ]
+                ),
+                _Ev(text="Order 1 shipped, order 2 delivered for alice@example.com."),
+            ]
+
+    messages: list[dict] = []
+    reply = await cli.run_turn(_Runner(), "alice.jones@example.com", "Check orders 1 and 2", messages)
+    assert mask_calls["n"] == 0
+    assert reply == "Order 1 shipped, order 2 delivered for alice@example.com."
+    tool_spans = [attrs for name, attrs in spans if name == "tool.get-order-status"]
+    assert len(tool_spans) == 2
+    assert json.loads(tool_spans[0]["input.value"]) == {"order_id": 1}
+    assert json.loads(tool_spans[1]["input.value"]) == {"order_id": 2}
+
+    # Verify CLI main uses greet_user, thinking_budget=0, and drops fake [2/3] Loading current orders
+    main_src = inspect.getsource(cli.main)
+    assert "greet_user(" in main_src
+    assert "thinking_budget=0" in main_src
+    assert "Loading current orders" not in main_src
+    assert "[1/2] Authenticating user" in main_src
+    assert "[2/2] Loading previous actions" in main_src
+
+
+def test_cli_print_known_shoppers_closes_db_handles_on_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    import psycopg2
+
+    import src.api.cli as cli
+
+    closed = {"cur": False, "conn": False}
+
+    class FakeCur:
+        description = []
+
+        def execute(self, sql):
+            raise RuntimeError("query boom")
+
+        def close(self):
+            closed["cur"] = True
+
+    class FakeConn:
+        def cursor(self):
+            return FakeCur()
+
+        def close(self):
+            closed["conn"] = True
+
+    monkeypatch.setattr(psycopg2, "connect", lambda dsn: FakeConn())
+    cli._print_known_shoppers()
+    assert closed == {"cur": True, "conn": True}
