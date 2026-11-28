@@ -8,7 +8,8 @@ ENV PYTHONUNBUFFERED=1 \
     PORT=8000
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY constraints.txt .
+RUN pip install --no-cache-dir -r requirements.txt -c constraints.txt
 
 COPY src ./src
 COPY mcp_toolbox ./mcp_toolbox

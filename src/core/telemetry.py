@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-from urllib.parse import urlparse
 
 DEFAULT_PHOENIX_URL = "http://localhost:6006"
 
@@ -67,21 +66,13 @@ def _open_browser_enabled() -> bool:
     )
 
 
-def _port_from_url(url: str, default: int = 6006) -> int:
-    parsed = urlparse(url)
-    if parsed.port:
-        return parsed.port
-    return 443 if parsed.scheme == "https" else default
-
-
 def init_telemetry():
-    """Configure the OTLP exporter and Phoenix, then return a real tracer.
+    """Configure the OTLP exporter and GenAI instrumentation, then return a real tracer.
 
-    Heavy imports stay inside this function so disabled runs never load Phoenix.
+    Heavy imports stay inside this function so disabled runs never load OpenTelemetry.
     """
     import webbrowser
 
-    import phoenix as px
     from openinference.instrumentation.google_genai import GoogleGenAIInstrumentor
     from opentelemetry import trace
     from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
@@ -89,16 +80,10 @@ def init_telemetry():
     from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
     export_url, public_url = resolve_phoenix_urls()
-    port = _port_from_url(export_url)
-    grpc_port = 4317 + (port - 6006)
-    os.environ["PHOENIX_PORT"] = str(port)
-    os.environ["PHOENIX_GRPC_PORT"] = str(grpc_port)
-    try:
-        px.launch_app()
-    except Exception as exc:  # noqa: BLE001
-        print(f"[telemetry] reusing Phoenix at {export_url} (launch skipped: {exc})")
+    api_key = os.getenv("PHOENIX_API_KEY", "").strip()
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else None
 
-    exporter = OTLPSpanExporter(endpoint=f"{export_url}/v1/traces")
+    exporter = OTLPSpanExporter(endpoint=f"{export_url}/v1/traces", headers=headers)
     provider = TracerProvider()
     provider.add_span_processor(BatchSpanProcessor(exporter))
     trace.set_tracer_provider(provider)

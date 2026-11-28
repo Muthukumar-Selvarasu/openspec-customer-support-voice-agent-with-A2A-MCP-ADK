@@ -146,13 +146,13 @@ services:
       WEB_PORT: "8000"
 
   phoenix:
-    image: docker.io/arizephoenix/phoenix:latest
+    image: docker.io/arizephoenix/phoenix:version-22.0.1
     environment:
       PHOENIX_WORKING_DIR: /mnt/data
       PHOENIX_PORT: "6006"
       PHOENIX_ENABLE_AUTH: "false"
     ports:
-      - "6006:6006"
+      - "127.0.0.1:6006:6006"
 
 volumes:
   cs_postgres_data:

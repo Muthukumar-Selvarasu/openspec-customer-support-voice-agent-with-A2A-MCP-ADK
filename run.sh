@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Local Podman orchestration for Postgres, MCP Toolbox, one A2A process,
 # the web app, and optional Phoenix.
-# The app image installs Python dependencies only with:
-#   pip install -r requirements.txt
+# The app image installs Python dependencies with:
+#   pip install -r requirements.txt -c constraints.txt
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

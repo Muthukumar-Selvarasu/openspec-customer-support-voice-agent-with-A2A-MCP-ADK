@@ -40,7 +40,7 @@ def main(ctx=None):
     )
     phoenix = service(
         "phoenix",
-        source=image("arizephoenix/phoenix:latest"),
+        source=image("arizephoenix/phoenix:version-22.0.1"),
         env={
             "PORT": "6006",
             "PHOENIX_ENABLE_AUTH": "false",

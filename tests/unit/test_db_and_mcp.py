@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 LOCAL_PACKAGES = (
     "google-adk",
+    "google-genai",
     "toolbox-core",
     "mem0ai",
     "fastapi",
@@ -26,9 +27,18 @@ LOCAL_PACKAGES = (
     "pytest-asyncio",
     "httpx",
     "pyyaml",
-    "arize-phoenix",
     "openinference-instrumentation-google-genai",
     "openinference-semantic-conventions",
+)
+
+BOUNDED_PACKAGES = (
+    "google-adk>=2.15.0,<3",
+    "google-genai>=2.34.0,<3",
+    "toolbox-core>=1.4.0,<2",
+    "mem0ai>=2.2.0,<3",
+    "openinference-instrumentation-google-genai>=1.5.0,<2",
+    "pytest>=9.0.0,<10",
+    "pytest-asyncio>=1.4.0,<2",
 )
 
 PINNED_PACKAGES = (
@@ -42,6 +52,8 @@ FORBIDDEN_PACKAGES = (
     "google-cloud-dlp",
     "google-cloud-secret-manager",
     "google-auth",
+    "arize-phoenix",
+    "requests",
 )
 
 ENV_KEYS = (
@@ -106,12 +118,18 @@ def _sql_tuples(sql: str, table: str) -> list[str]:
 
 def test_requirements_list_local_packages_and_omit_leftovers() -> None:
     requirements = _text("requirements.txt")
-    lowered = requirements.lower()
+    req_lines = {
+        raw.split("#", 1)[0].strip().lower()
+        for raw in requirements.splitlines()
+        if raw.split("#", 1)[0].strip()
+    }
     names = _requirement_names(requirements)
     for package in LOCAL_PACKAGES:
         assert package in names, package
+    for spec in BOUNDED_PACKAGES:
+        assert spec in req_lines, spec
     for pin in PINNED_PACKAGES:
-        assert pin in lowered, pin
+        assert pin in req_lines, pin
     for leftover in FORBIDDEN_PACKAGES:
         assert leftover not in names, leftover
 
@@ -290,13 +308,54 @@ def test_run_sh_compose_publishes_cascade_ports_and_one_a2a_process() -> None:
 def test_phoenix_auth_stays_off_in_compose_and_runtime_copy() -> None:
     compose_text = _text("compose.yaml")
     compose = yaml.safe_load(compose_text)
-    assert compose["services"]["phoenix"]["environment"]["PHOENIX_ENABLE_AUTH"] == "false"
+    phoenix = compose["services"]["phoenix"]
+    assert phoenix["image"] == "docker.io/arizephoenix/phoenix:version-22.0.1"
+    assert phoenix["ports"] == ["127.0.0.1:6006:6006"]
+    assert phoenix["environment"]["PHOENIX_ENABLE_AUTH"] == "false"
     old = '    ports:\n      - "5000:5000"\n'
     assert old in compose_text
     runtime = yaml.safe_load(compose_text.replace(old, "", 1))
-    assert runtime["services"]["phoenix"]["environment"]["PHOENIX_ENABLE_AUTH"] == "false"
+    runtime_phoenix = runtime["services"]["phoenix"]
+    assert runtime_phoenix["image"] == "docker.io/arizephoenix/phoenix:version-22.0.1"
+    assert runtime_phoenix["ports"] == ["127.0.0.1:6006:6006"]
+    assert runtime_phoenix["environment"]["PHOENIX_ENABLE_AUTH"] == "false"
     toolbox_ports = runtime["services"]["mcp-toolbox"].get("ports") or []
     assert "5000:5000" not in [str(item) for item in toolbox_ports]
+
+
+def test_phoenix_image_tag_pinned_across_compose_and_railway() -> None:
+    compose_text = _text("compose.yaml")
+    railway_text = _text(".railway/railway.py")
+    assert ":latest" not in compose_text
+    assert ":latest" not in railway_text
+
+    compose = yaml.safe_load(compose_text)
+    compose_image = str(compose["services"]["phoenix"]["image"])
+    compose_tag = compose_image.rsplit(":", 1)[-1]
+    assert compose_image == "docker.io/arizephoenix/phoenix:version-22.0.1"
+    assert compose["services"]["phoenix"]["ports"] == ["127.0.0.1:6006:6006"]
+
+    match = re.search(r'image\("arizephoenix/phoenix:([^"]+)"\)', railway_text)
+    assert match, "expected pinned arizephoenix/phoenix image in .railway/railway.py"
+    railway_tag = match.group(1)
+    assert railway_tag == "version-22.0.1"
+    assert railway_tag == compose_tag
+
+
+def test_constraints_lockfile_wired_in_dockerfile_and_ci() -> None:
+    constraints = _text("constraints.txt")
+    assert "google-adk==" in constraints
+    assert "google-genai==" in constraints
+    assert "opentelemetry-sdk==1.42.1" in constraints
+
+    dockerfile = _text("Dockerfile")
+    assert "COPY constraints.txt ." in dockerfile
+    assert "pip install --no-cache-dir -r requirements.txt -c constraints.txt" in dockerfile
+    assert 'CMD ["python", "-m", "src.api.web"]' in dockerfile
+
+    ci = _text(".github/workflows/ci.yml")
+    assert "pip install -r requirements.txt -c constraints.txt" in ci
+    assert "pytest tests/unit tests/integration tests/evals" in ci
 
 
 def test_readme_documents_local_podman_launch() -> None:

@@ -85,12 +85,12 @@ Stop:
 ./run.sh down
 ```
 
-Python dependencies install from `requirements.txt` only (`pip install -r requirements.txt` in the app image and on the host). There is no second pip list.
+Direct Python dependencies live in `requirements.txt` with deterministic versions locked in `constraints.txt` (`pip install -r requirements.txt -c constraints.txt` in the app image, CI, and on the host). When updating `requirements.txt`, regenerate `constraints.txt` with `uv pip compile --universal --python-version 3.12 requirements.txt -o constraints.txt`. For host runs with `TELEMETRY=true`, start the standalone Phoenix container (`podman compose up -d phoenix`) or set `TELEMETRY=false` (the app exports OTLP traces without launching an embedded Phoenix server).
 
 ## Tests
 
 ```bash
-pip install -r requirements.txt
+pip install -r requirements.txt -c constraints.txt
 pytest tests/unit tests/integration tests/evals
 ```
 

@@ -235,21 +235,15 @@ def test_telemetry_resolves_phoenix_urls(monkeypatch: pytest.MonkeyPatch) -> Non
     )
 
 
-def test_telemetry_skips_browser_open_when_disabled(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("TELEMETRY", "true")
-    monkeypatch.setenv("PHOENIX_OPEN_BROWSER", "false")
-    monkeypatch.setenv("PHOENIX_URL", "http://phoenix.internal:6006")
-    monkeypatch.setenv("PHOENIX_PUBLIC_URL", "http://phoenix.public:6006")
-    telemetry_mod.reset_telemetry_state()
-
+def _install_fake_otel_modules(monkeypatch: pytest.MonkeyPatch) -> tuple[MagicMock, MagicMock, MagicMock, list[str]]:
     opened: list[str] = []
-    fake_px = MagicMock()
     fake_trace = MagicMock()
     fake_trace.get_tracer.return_value = object()
+    fake_exporter_cls = MagicMock()
+    fake_instrumentor_cls = MagicMock()
 
-    monkeypatch.setitem(sys.modules, "phoenix", fake_px)
+    # Poison `phoenix` in sys.modules so any `import phoenix` raises ModuleNotFoundError.
+    monkeypatch.setitem(sys.modules, "phoenix", None)  # type: ignore[arg-type]
     monkeypatch.setitem(sys.modules, "webbrowser", MagicMock(open=opened.append))
     monkeypatch.setitem(sys.modules, "opentelemetry", MagicMock(trace=fake_trace))
     monkeypatch.setitem(sys.modules, "opentelemetry.trace", fake_trace)
@@ -266,18 +260,111 @@ def test_telemetry_skips_browser_open_when_disabled(
     monkeypatch.setitem(
         sys.modules,
         "opentelemetry.exporter.otlp.proto.http.trace_exporter",
-        MagicMock(OTLPSpanExporter=MagicMock()),
+        MagicMock(OTLPSpanExporter=fake_exporter_cls),
     )
     monkeypatch.setitem(
         sys.modules,
         "openinference.instrumentation.google_genai",
-        MagicMock(GoogleGenAIInstrumentor=MagicMock()),
+        MagicMock(GoogleGenAIInstrumentor=fake_instrumentor_cls),
+    )
+    return fake_trace, fake_exporter_cls, fake_instrumentor_cls, opened
+
+
+def test_telemetry_skips_browser_open_when_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TELEMETRY", "true")
+    monkeypatch.setenv("PHOENIX_OPEN_BROWSER", "false")
+    monkeypatch.setenv("PHOENIX_URL", "http://phoenix.internal:6006")
+    monkeypatch.setenv("PHOENIX_PUBLIC_URL", "http://phoenix.public:6006")
+    monkeypatch.delenv("PHOENIX_API_KEY", raising=False)
+    monkeypatch.delenv("PHOENIX_PORT", raising=False)
+    monkeypatch.delenv("PHOENIX_GRPC_PORT", raising=False)
+    telemetry_mod.reset_telemetry_state()
+
+    fake_trace, fake_exporter_cls, fake_instrumentor_cls, opened = _install_fake_otel_modules(
+        monkeypatch
     )
 
     tracer = telemetry_mod.get_tracer()
     try:
         assert tracer is fake_trace.get_tracer.return_value
-        fake_px.launch_app.assert_called_once()
+        fake_exporter_cls.assert_called_once_with(
+            endpoint="http://phoenix.internal:6006/v1/traces",
+            headers=None,
+        )
+        fake_instrumentor_cls.return_value.instrument.assert_called_once()
         assert opened == []
+        assert not hasattr(telemetry_mod, "_port_from_url")
+        assert "PHOENIX_PORT" not in telemetry_mod.os.environ
+        assert "PHOENIX_GRPC_PORT" not in telemetry_mod.os.environ
     finally:
         telemetry_mod.reset_telemetry_state()
+
+
+def test_telemetry_otlp_exporter_omits_auth_header_when_api_key_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TELEMETRY", "true")
+    monkeypatch.setenv("PHOENIX_OPEN_BROWSER", "false")
+    monkeypatch.setenv("PHOENIX_URL", "http://phoenix.internal:6006")
+    monkeypatch.delenv("PHOENIX_API_KEY", raising=False)
+    telemetry_mod.reset_telemetry_state()
+
+    fake_trace, fake_exporter_cls, _fake_instrumentor_cls, _opened = _install_fake_otel_modules(
+        monkeypatch
+    )
+
+    tracer = telemetry_mod.get_tracer()
+    try:
+        assert tracer is fake_trace.get_tracer.return_value
+        fake_exporter_cls.assert_called_once_with(
+            endpoint="http://phoenix.internal:6006/v1/traces",
+            headers=None,
+        )
+    finally:
+        telemetry_mod.reset_telemetry_state()
+
+
+def test_telemetry_otlp_exporter_sends_bearer_header_when_api_key_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TELEMETRY", "true")
+    monkeypatch.setenv("PHOENIX_OPEN_BROWSER", "false")
+    monkeypatch.setenv("PHOENIX_URL", "http://phoenix.internal:6006")
+    monkeypatch.setenv("PHOENIX_API_KEY", "secret-token")
+    telemetry_mod.reset_telemetry_state()
+
+    fake_trace, fake_exporter_cls, _fake_instrumentor_cls, _opened = _install_fake_otel_modules(
+        monkeypatch
+    )
+
+    tracer = telemetry_mod.get_tracer()
+    try:
+        assert tracer is fake_trace.get_tracer.return_value
+        fake_exporter_cls.assert_called_once_with(
+            endpoint="http://phoenix.internal:6006/v1/traces",
+            headers={"Authorization": "Bearer secret-token"},
+        )
+    finally:
+        telemetry_mod.reset_telemetry_state()
+
+
+def test_telemetry_packages_import_cleanly_without_mocking() -> None:
+    before = set(sys.modules)
+    from openinference.instrumentation.google_genai import GoogleGenAIInstrumentor
+    from openinference.semconv.trace import SpanAttributes
+    from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import BatchSpanProcessor
+
+    assert TracerProvider is not None
+    assert BatchSpanProcessor is not None
+    assert OTLPSpanExporter is not None
+    assert GoogleGenAIInstrumentor is not None
+    assert SpanAttributes is not None
+    assert telemetry_mod.ATTR is SpanAttributes
+    newly_imported = set(sys.modules) - before
+    assert not any(
+        name == "phoenix" or name.startswith("phoenix.") for name in newly_imported
+    )
