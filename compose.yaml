@@ -86,6 +86,9 @@ services:
       MEM0_API_KEY: ${MEM0_API_KEY:-}
       MASK: ${MASK:-true}
       AGENT_RESPONSE_STREAM: ${AGENT_RESPONSE_STREAM:-false}
+      VOICE_STT_LIVE_MODEL: ${VOICE_STT_LIVE_MODEL:-gemini-3.1-flash-live-preview}
+      VOICE_PRICE_STT_IN: ${VOICE_PRICE_STT_IN:-3.00}
+      VOICE_PRICE_STT_OUT: ${VOICE_PRICE_STT_OUT:-4.50}
       TELEMETRY: ${TELEMETRY:-true}
       DATABASE_URL: postgresql://toolbox_user:mysecretpassword@postgres:5432/toolbox_db
       TOOLBOX_URL: http://mcp-toolbox:5000
@@ -132,6 +135,9 @@ services:
       MEM0_API_KEY: ${MEM0_API_KEY:-}
       MASK: ${MASK:-true}
       AGENT_RESPONSE_STREAM: ${AGENT_RESPONSE_STREAM:-false}
+      VOICE_STT_LIVE_MODEL: ${VOICE_STT_LIVE_MODEL:-gemini-3.1-flash-live-preview}
+      VOICE_PRICE_STT_IN: ${VOICE_PRICE_STT_IN:-3.00}
+      VOICE_PRICE_STT_OUT: ${VOICE_PRICE_STT_OUT:-4.50}
       TELEMETRY: ${TELEMETRY:-true}
       DATABASE_URL: postgresql://toolbox_user:mysecretpassword@postgres:5432/toolbox_db
       TOOLBOX_URL: http://mcp-toolbox:5000

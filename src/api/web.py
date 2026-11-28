@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import os
 import time
@@ -18,7 +19,7 @@ from pathlib import Path
 import yaml
 from dotenv import load_dotenv
 from fastapi import FastAPI
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from google.adk.agents.llm_agent import LlmAgent
 from google.adk.agents.run_config import RunConfig, StreamingMode
@@ -206,7 +207,7 @@ def _load_tool_catalogue() -> dict:
                 "ADK",
                 "toolbox-core",
                 "MCP tools/call",
-                "Toolbox :5000",
+                "MCP Toolbox",
                 "PostgreSQL",
             ],
             "runs": f"{tool.get('kind', 'tool')} on {tool.get('source', 'postgres')}",
@@ -975,7 +976,14 @@ def theme_css():
 
 @app.get("/architecture")
 def architecture_page():
-    return FileResponse(_STATIC / "architecture.html", media_type="text/html")
+    page = (_STATIC / "architecture.html").read_text(encoding="utf-8")
+    phoenix_public_url = html.escape(
+        resolve_service_settings().phoenix_public_url, quote=True
+    )
+    page = page.replace(
+        'href="http://localhost:6006"', f'href="{phoenix_public_url}"', 1
+    )
+    return HTMLResponse(content=page)
 
 
 @app.get("/architecture.svg")

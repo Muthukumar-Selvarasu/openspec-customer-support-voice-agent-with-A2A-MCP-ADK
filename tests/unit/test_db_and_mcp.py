@@ -108,7 +108,7 @@ def _requirement_names(requirements: str) -> set[str]:
 
 def _sql_tuples(sql: str, table: str) -> list[str]:
     match = re.search(
-        rf"INSERT INTO {table}\b.*?VALUES\s*(.*?);",
+        rf"INSERT INTO {table}\b.*?VALUES\s*(.*?)(?:ON CONFLICT|;)",
         sql,
         flags=re.IGNORECASE | re.DOTALL,
     )
@@ -158,8 +158,10 @@ def test_env_example_documents_localhost_defaults() -> None:
 
 def test_seed_defines_tables_and_demo_shoppers() -> None:
     sql = _text("mcp_toolbox/seed.sql")
+    assert "DROP TABLE IF EXISTS" not in sql.upper()
     for table in ("users", "customer_orders", "actions_log"):
-        assert re.search(rf"CREATE TABLE {table}\b", sql), table
+        assert re.search(rf"CREATE TABLE (?:IF NOT EXISTS )?{table}\b", sql), table
+        assert re.search(rf"CREATE TABLE IF NOT EXISTS {table}\b", sql), table
     users = _sql_tuples(sql, "users")
     orders = _sql_tuples(sql, "customer_orders")
     assert len(users) == 10
@@ -169,7 +171,20 @@ def test_seed_defines_tables_and_demo_shoppers() -> None:
     for status in ORDER_STATUSES:
         assert any(f"'{status}'" in row for row in orders), status
     assert "REFERENCES users (email)" in sql
-    assert "customer_orders_customer_email_idx" in sql
+    assert "CREATE INDEX IF NOT EXISTS customer_orders_customer_email_idx" in sql
+    assert "ON CONFLICT (email) DO NOTHING" in sql
+    assert "ON CONFLICT (order_id) DO NOTHING" in sql
+    assert "pg_get_serial_sequence('customer_orders', 'order_id')" in sql
+    assert "pg_roles" in sql
+    assert "rolname = 'toolbox_user'" in sql
+
+
+CANONICAL_ACTION_TYPES = (
+    "UPDATE_ORDER_STATUS",
+    "RETURN_ITEM",
+    "UPDATE_DELIVERY_ADDRESS",
+    "UPDATE_PROFILE_DETAILS",
+)
 
 
 def test_tools_catalog_scopes_order_lookup_to_the_customer() -> None:
@@ -183,6 +198,12 @@ def test_tools_catalog_scopes_order_lookup_to_the_customer() -> None:
     for name in TOOL_NAMES:
         assert catalog["tools"][name]["kind"] == "postgres-sql"
         assert catalog["tools"][name]["source"] == "cs-postgres"
+    action_params = {
+        item["name"]: item["description"]
+        for item in catalog["tools"]["action-log"]["parameters"]
+    }
+    for action_type in CANONICAL_ACTION_TYPES:
+        assert action_type in action_params["action_type"], action_type
     source = catalog["sources"]["cs-postgres"]
     assert source["host"] == "127.0.0.1"
     assert source["port"] == 5432
@@ -239,6 +260,11 @@ def test_run_sh_parses_and_calls_podman_compose() -> None:
     assert "podman-compose" in script
     assert "gen_config_files" in script
     assert "podman compose run --rm cli python -m src.api.cli" in script
+    assert "compose_file" in script
+    assert 'compose -f "$(compose_file)" down' in script
+    assert 'compose -f "$(compose_file)" ps' in script
+    assert "--no-phoenix" in script
+    assert "PHOENIX:-true" in script
     assert not _DOCKER_CLI.search(script)
     installs = re.findall(r"pip install[^\n]*", script)
     assert installs == [] or all("-r requirements.txt" in line for line in installs)
@@ -263,6 +289,12 @@ def test_run_sh_generated_tools_keep_tenant_sql_on_compose_host() -> None:
     assert parameters == ["order_id", "customer_email"]
     statement = " ".join(lookup["statement"].split())
     assert "WHERE order_id = $1 AND customer_email = $2" in statement
+    heredoc_action_params = {
+        item["name"]: item["description"]
+        for item in catalog["tools"]["action-log"]["parameters"]
+    }
+    for action_type in CANONICAL_ACTION_TYPES:
+        assert action_type in heredoc_action_params["action_type"], action_type
     assert "postgresql://toolbox_user:mysecretpassword@127.0.0.1:5432/toolbox_db" in script
     assert "cat > .run/tools.yaml" in script
     for leftover in FORBIDDEN_ENV_KEYS:
@@ -298,6 +330,8 @@ def test_run_sh_compose_publishes_cascade_ports_and_one_a2a_process() -> None:
     assert services["a2a"]["environment"]["A2A_JUDGE_HOST"] == "0.0.0.0"
     assert services["a2a"]["environment"]["A2A_MASK_HOST"] == "0.0.0.0"
     assert services["web"]["environment"]["HOST"] == "0.0.0.0"
+    for key in ("VOICE_STT_LIVE_MODEL", "VOICE_PRICE_STT_IN", "VOICE_PRICE_STT_OUT"):
+        assert key in services["web"]["environment"], key
     published: list[str] = []
     for service in services.values():
         published.extend(str(item) for item in service.get("ports") or [])
@@ -391,6 +425,82 @@ def test_railway_config_lists_services_without_a_database_plugin() -> None:
     assert "RAILWAY_TOKEN" in readme
     assert "Neon" in readme
     assert "mysecretpassword@" not in readme.split("## Railway", 1)[-1]
+
+
+def test_start_toolbox_preserves_neon_ssl_query_params() -> None:
+    node = shutil.which("node")
+    assert node is not None, "node is required to verify scripts/start-toolbox.mjs"
+    script_url = (ROOT / "scripts" / "start-toolbox.mjs").resolve().as_uri()
+    template_path = str((ROOT / "mcp_toolbox" / "tools.yaml").resolve())
+
+    def _render(db_url: str) -> dict:
+        code = (
+            f"import {{ readFileSync }} from 'node:fs';"
+            f"import {{ buildToolsCatalog }} from {script_url!r};"
+            f"const tpl = readFileSync({template_path!r}, 'utf8');"
+            f"process.stdout.write(buildToolsCatalog({db_url!r}, tpl));"
+        )
+        proc = subprocess.run(
+            [node, "--input-type=module", "-e", code],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert proc.returncode == 0, proc.stderr
+        return yaml.safe_load(proc.stdout)
+
+    neon_catalog = _render(
+        "postgresql://neondb_owner:secret%23pass@ep-cool-pooler.us-east-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
+    )
+    neon_source = neon_catalog["sources"]["cs-postgres"]
+    assert neon_source["host"] == "ep-cool-pooler.us-east-2.aws.neon.tech"
+    assert neon_source["port"] == 5432
+    assert neon_source["database"] == "neondb"
+    assert neon_source["user"] == "neondb_owner"
+    assert neon_source["password"] == "secret#pass"
+    assert neon_source["queryParams"] == {
+        "sslmode": "require",
+        "channel_binding": "require",
+    }
+
+    local_catalog = _render(
+        "postgresql://toolbox_user:mysecretpassword@127.0.0.1:5432/toolbox_db"
+    )
+    local_source = local_catalog["sources"]["cs-postgres"]
+    assert local_source["host"] == "127.0.0.1"
+    assert local_source["port"] == 5432
+    assert "queryParams" not in local_source
+
+
+def test_railway_phoenix_auth_public_url_and_healthchecks() -> None:
+    config = _text(".railway/railway.py")
+    assert '"PHOENIX_PUBLIC_URL": "https://${{phoenix.RAILWAY_PUBLIC_DOMAIN}}"' in config
+    assert '"PHOENIX_PUBLIC_URL": _private("phoenix")' not in config
+    assert '"PHOENIX_API_KEY": preserve()' in config
+    assert '"PHOENIX_ENABLE_AUTH": "true"' in config
+    assert '"PHOENIX_ENABLE_AUTH": "false"' not in config
+    assert '"PHOENIX_SECRET": preserve()' in config
+    assert 'image("arizephoenix/phoenix:version-22.0.1")' in config
+
+    service_blocks = dict(
+        re.findall(
+            r'service\(\s*"([^"]+)",(.*?)\n    \)',
+            config,
+            flags=re.DOTALL,
+        )
+    )
+    assert set(service_blocks) == {
+        "mcp-toolbox",
+        "a2a-judge",
+        "a2a-masker",
+        "phoenix",
+        "web-voice-app",
+    }
+    for svc in ("mcp-toolbox", "phoenix", "web-voice-app"):
+        assert 'healthcheck="/"' in service_blocks[svc], svc
+    for svc in ("a2a-judge", "a2a-masker"):
+        assert 'healthcheck="/.well-known/agent.json"' in service_blocks[svc], svc
 
 
 def test_postgres_podman_seed_counts() -> None:

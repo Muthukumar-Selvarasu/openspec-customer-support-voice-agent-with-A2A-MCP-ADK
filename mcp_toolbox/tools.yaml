@@ -79,7 +79,7 @@ tools:
         description: The authenticated user's email.
       - name: action_type
         type: string
-        description: The action type, for example CANCEL_ORDER, RETURN_ORDER, UPDATE_ADDRESS, UPDATE_PROFILE.
+        description: The action type, for example UPDATE_ORDER_STATUS, RETURN_ITEM, UPDATE_DELIVERY_ADDRESS, UPDATE_PROFILE_DETAILS.
       - name: parameters
         type: string
         description: >

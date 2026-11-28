@@ -1,7 +1,7 @@
 @import url("https://fonts.googleapis.com/css2?family=Inter+Tight:wght@400;500;600;700&family=Instrument+Serif:ital@0;1&display=swap");
 
 :root {
-  /* page and surfaces (light-only) */
+  /* page and surfaces (light default) */
   --paper:      #ffffff;
   --paper-2:    #f5f3ee;
   --bg-soft:    #f6f5f1;
@@ -253,12 +253,6 @@ header h1 small, .ds-header h1 small {
 }
 
 /* Aurora backdrop (scoped to hero / sign-in only, never behind body text) */
-.ds-aurora-wrap {
-  position: relative;
-  overflow: hidden;
-  border-radius: var(--radius);
-}
-
 .ds-aurora {
   position: fixed;
   inset: -12% -10%;

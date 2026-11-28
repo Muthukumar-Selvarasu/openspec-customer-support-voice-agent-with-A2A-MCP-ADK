@@ -7,7 +7,7 @@ Deploys the cascade voice and chat platform to Railway as independent services o
 ## Requirements
 
 ### Requirement: Independent Railway Services
-The system SHALL be deployable as separate Railway services `mcp-toolbox`, `a2a-judge`, `a2a-masker`, and `web-voice-app`, with optional `phoenix`. Judge, Masker, and Toolbox MUST NOT be public. Postgres SHALL be Neon, not a Railway Postgres plugin.
+The system SHALL deploy separate Railway services `mcp-toolbox`, `a2a-judge`, `a2a-masker`, `web-voice-app`, and optional `phoenix` via `.railway/railway.py` (`.railway/requirements.txt`), `Dockerfile`, and `Dockerfile.toolbox` + `scripts/start-toolbox.mjs`. Each service SHALL declare a `healthcheck` (`/` or `/.well-known/agent.json`). Judge, Masker, and Toolbox MUST NOT be public; Postgres SHALL be Neon.
 
 #### Scenario: Private services stay internal
 - **WHEN** the Railway project is inspected
@@ -17,8 +17,12 @@ The system SHALL be deployable as separate Railway services `mcp-toolbox`, `a2a-
 - **WHEN** Railway services are listed
 - **THEN** there is no Railway-managed Postgres service
 
+#### Scenario: Railway definition, healthchecks, and Toolbox container files are present
+- **WHEN** `.railway/railway.py`, `.railway/requirements.txt`, `Dockerfile.toolbox`, and `scripts/start-toolbox.mjs` are inspected
+- **THEN** `mcp-toolbox` builds from `Dockerfile.toolbox` and starts `scripts/start-toolbox.mjs`, `a2a-judge`, `a2a-masker`, and `web-voice-app` build from `Dockerfile`, and all services declare their respective `healthcheck` paths
+
 ### Requirement: Neon DATABASE_URL
-On Railway, `web-voice-app` and `mcp-toolbox` SHALL use a Neon pooled `DATABASE_URL` with `sslmode=require`. `TOOLBOX_URL`, `A2A_JUDGE_HOST`, `A2A_MASK_HOST`, and `PHOENIX_URL` SHALL use Railway private hostnames, not `127.0.0.1`. `web-voice-app` SHALL bind `0.0.0.0` and `$PORT`.
+On Railway, `web-voice-app` and `mcp-toolbox` SHALL use a Neon pooled `DATABASE_URL` (`sslmode=require`) preserved in `/tmp/tools.yaml` by `scripts/start-toolbox.mjs`. Internal service URLs SHALL use Railway private hostnames; `PHOENIX_PUBLIC_URL` SHALL use a public HTTPS URL with `PHOENIX_ENABLE_AUTH="true"` and `PHOENIX_SECRET` on Railway `phoenix`; `web-voice-app` SHALL bind `0.0.0.0:$PORT`.
 
 #### Scenario: Web binds the platform port
 - **WHEN** `web-voice-app` starts on Railway
@@ -27,6 +31,14 @@ On Railway, `web-voice-app` and `mcp-toolbox` SHALL use a Neon pooled `DATABASE_
 #### Scenario: Database is Neon
 - **WHEN** `DATABASE_URL` is inspected on Railway
 - **THEN** it is a Neon host (pooled) and is not committed to git
+
+#### Scenario: Toolbox entrypoint preserves Neon sslmode=require
+- **WHEN** `scripts/start-toolbox.mjs` parses a Neon `DATABASE_URL` containing `?sslmode=require`
+- **THEN** the generated `/tmp/tools.yaml` includes the SSL query parameters rather than dropping them
+
+#### Scenario: PHOENIX_PUBLIC_URL is browser-reachable and Railway Phoenix requires auth
+- **WHEN** `.railway/railway.py` is inspected
+- **THEN** `web-voice-app` sets `PHOENIX_PUBLIC_URL` to a public HTTPS URL (`https://${{phoenix.RAILWAY_PUBLIC_DOMAIN}}`), not `RAILWAY_PRIVATE_DOMAIN`, and preserves `PHOENIX_API_KEY`, while the Railway `phoenix` service sets `PHOENIX_ENABLE_AUTH="true"` with `PHOENIX_SECRET` via `preserve()`
 
 ### Requirement: Secrets Are Not Committed
 `GOOGLE_API_KEY`, `MEM0_API_KEY`, Neon `DATABASE_URL`, and `RAILWAY_TOKEN` MUST NOT be committed to git. Deploy using CLI login or `RAILWAY_TOKEN` MAY be skipped until the operator supplies auth.

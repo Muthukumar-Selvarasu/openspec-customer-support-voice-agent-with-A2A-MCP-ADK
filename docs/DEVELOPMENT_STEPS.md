@@ -119,7 +119,7 @@ Each OpenSpec change was implemented using a consistent iterative development lo
 15. **Step 15 — Build Slice `06-web-and-cli-channels`**
     - Added the shopper Web Chat + Voice UI (`src/static/index.html`) and live SVG Architecture dashboard (`src/static/architecture.html`, `src/static/architecture.svg`).
     - Built the FastAPI server (`src/api/web.py`) with `_enforce_tenant_tool_callback` (overwriting tool identity args with the logged-in session and blocking `update-order-status`), NDJSON glass-box step streaming (`POST /api/chat/stream`), and `/voice/ws` mounting.
-    - Built the operator Terminal CLI (`src/api/cli.py`) with unified sanitization, topical guardrail, and preserved response casing, verified in `tests/integration/test_api_and_tenant.py`.
+    - Built the operator Terminal CLI (`src/api/cli.py`) sharing the unified pipeline (sanitized `clean` input, Layer 2 A2A Judge security + `OFF_TOPIC` domain-scope gating paired with `SQL_PROMPT_INSTRUCTION` scope rather than a separate CLI Layer 2b guardrail, and preserved masked response casing), verified in `tests/integration/test_api_and_tenant.py`.
 
 16. **Step 16 — Build Slice `07-ops-docker-and-ci`**
     - Extended `compose.yaml` and created `run.sh` to orchestrate the full local stack with Podman (`postgres`, `mcp-toolbox`, `a2a`, `web`, and optional `phoenix`).
@@ -131,16 +131,34 @@ Each OpenSpec change was implemented using a consistent iterative development lo
     - Added a live header toggle between **Explain** mode (full cascade with A2A Judge, A2A Masker, and open `"What happened"` inspector) and **Quick** mode (skipping Judge/Masker for low-latency streaming demos).
 
 18. **Step 18 — Build Slice `10-session-survives-refresh`**
-    - Added `GET /api/session` and browser session restoration so reloading a signed-in tab preserves the active shopper session and ADK conversation history while still flushing Mem0 on explicit sign-out or actual tab close.
+    - Added `POST /api/session` and `POST /api/page-leave` (`3000 ms` grace window) with browser session restoration so reloading a signed-in tab preserves the active shopper session and ADK conversation history while still flushing Mem0 on explicit sign-out or actual tab close.
 
 19. **Step 19 — Build Slice `11-push-to-talk-fast-response`**
     - Upgraded voice input to stream 16 kHz PCM live to Gemini Live (`gemini-3.1-flash-live-preview`) for real-time interim transcription.
-    - Added walkie-talkie Push-to-Talk (`#mic` button and `Tab` hotkey) with a `1.0 s` post-release tail window (`PTT_RELEASE_TAIL_MS = 1000`) to prevent last-word clipping and `0 ms` settle on release.
-    - Added smart interrupt handling, clause-level TTS streaming (`[:;\n]`), header toggles (`#toggleJudge`, `#toggleMask`), and concurrent A2A Security Judge execution.
+    - Added walkie-talkie Push-to-Talk (`#mic` button and `Tab` hotkey) with a `1.0 s` post-release tail window (`PTT_RELEASE_TAIL_MS = 1000`) to prevent last-word clipping and `0 ms` settle on release (`400 ms` Quick / `1500 ms` Explain non-PTT settle).
+    - Added echo-resistant barge-in (`BARGE_RMS = 0.12`), clause/sentence TTS streaming, header guardrail toggles (`#toggleJudge`, `#toggleMask`), and concurrent A2A Security Judge execution.
 
-### Production Cloud Deployment
+### Production Cloud Deployment, Design System & Post-Launch Hardening
 
-20. **Step 20 — Build Slice `08-railway-deploy`: Multi-Service Cloud Deployment**
-    - Configured multi-service Railway deployment (`.railway/`, `Dockerfile.toolbox`, and single-role A2A entrypoints) while keeping `./run.sh` for local Podman execution.
-    - Provisioned **Neon PostgreSQL** (`DATABASE_URL` with `sslmode=require`) and applied `mcp_toolbox/seed.sql` once.
-    - Deployed `web-voice-app` (public HTTPS domain) alongside `mcp-toolbox`, `a2a-judge`, `a2a-masker`, and `phoenix` communicating over Railway private networking (`*.railway.internal`), and verified live health and UI behavior.
+20. **Step 20 — Build & Archive Slice `08-railway-deploy`: Multi-Service Cloud Deployment**
+    - Configured multi-service Railway deployment (`.railway/railway.py`, `.railway/requirements.txt`, `Dockerfile.toolbox`, `scripts/start-toolbox.mjs`, and single-role `A2A_ONLY` entrypoints) while keeping `./run.sh` isolated for local Podman execution.
+    - Provisioned **Neon PostgreSQL** (`DATABASE_URL` with `sslmode=require`) and deployed `web-voice-app` (public HTTPS domain) alongside private `mcp-toolbox`, `a2a-judge`, `a2a-masker`, and `phoenix` services, then archived the change into `openspec/specs/`.
+
+21. **Step 21 — Build & Archive Slice `12-design-system-ui`: Shared Light/Dark Design System**
+    - Added `src/static/theme.css` adapting light base tokens from `docs/DESIGN.md` plus an app-specific dark palette (`:root[data-theme="dark"]`), sticky glass headers, pill controls, aurora sign-in backdrop (`#loginScreen`), synced light/dark theme toggle across `/` and `/architecture`, and fixed `Tab` Push-to-Talk repeat behavior in `src/voice/ui.js`.
+
+22. **Step 22 — Build & Archive Slice `16-dependency-and-telemetry-upgrades`: Dependency Lockfile & Standalone Phoenix**
+    - Upgraded bounded ranges in `requirements.txt` (`google-adk`, `google-genai`, `toolbox-core`, `mem0ai`, `openinference-instrumentation-google-genai`, `pytest`, `pytest-asyncio`) and generated deterministic `constraints.txt` wired into `Dockerfile` and `.github/workflows/ci.yml` (`-c constraints.txt`).
+    - Removed embedded `arize-phoenix` from the app image, pinned `arizephoenix/phoenix:version-22.0.1` across `compose.yaml` (loopback `127.0.0.1:6006:6006`) and `.railway/railway.py`, and disabled the third-party `phoenix` pytest plugin via `pytest.ini` (`addopts = -p no:phoenix`).
+
+23. **Step 23 — Build & Archive Slice `13-security-and-pii-hardening`: Defense-in-Depth Security & PII Masking**
+    - Hardened Guardrail L1/L2 to screen raw pre-sanitized input, enforce strict pre-agent A2A Judge gating with `ALLOW` / `BLOCKED` / `OFF_TOPIC` customer-support domain scope across Web, Voice, and CLI, and reinforce scope in `SQL_PROMPT_INSTRUCTION`.
+    - Achieved 100% seeded PII redaction in `src/security/masker.py` with local fallback when `:10003` is unreachable, bound `search_memory` to the authenticated session (`make_memory_search_tool`), hardened `_enforce_tenant_tool_callback` (fail-closed identity + `action-log` validation), and hardened A2A JSON-RPC servers.
+
+24. **Step 24 — Build & Archive Slice `14-voice-and-session-fixes`: Voice Masking, Streaming & Session Parity**
+    - Implemented sentence-level masked voice streaming (`MASK=true`) with full OTel spans and cost accounting, Quick-mode explicit guardrail overrides, PTT tab-close Mem0 flushing, voice UI metrics/controls cleanup, Gemini 3.1 Live STT trailing-silence padding & drain cap, non-blocking Phoenix trace lookups (`resolve_trace_url`), and streamlined 2-stage CLI parity in `src/api/cli.py`.
+
+25. **Step 25 — Build Slice `15-railway-and-docs-reconciliation`: Railway Hardening, Idempotent Seed & Docs Sync**
+    - Updated `scripts/start-toolbox.mjs` (`buildToolsCatalog`) to preserve Neon `DATABASE_URL` query parameters (`?sslmode=require`) via `@toolbox-sdk/server@1.5.0` `queryParams`.
+    - Hardened `.railway/railway.py` with browser-reachable `PHOENIX_PUBLIC_URL`, authenticated Railway `phoenix` (`PHOENIX_ENABLE_AUTH="true"`, `PHOENIX_SECRET`, `PHOENIX_API_KEY`), and explicit healthchecks on all 5 Railway services; updated `GET /architecture` to inject `PHOENIX_PUBLIC_URL`, replaced `"Toolbox :5000"` with `"MCP Toolbox"`, added Guardrail L1–L3 badges/legend to `architecture.svg` / `architecture.html`, and cleaned up `src/static/theme.css`.
+    - Rewrote `mcp_toolbox/seed.sql` to be non-destructive, idempotent, and Neon-role-safe (`pg_roles`-guarded `toolbox_user` grants); aligned canonical `action-log` types in `mcp_toolbox/tools.yaml` and `run.sh`; added `compose.runtime.yaml` lifecycle handling and optional `PHOENIX=false` / `--no-phoenix` in `run.sh`; forwarded Live STT env vars in `compose.yaml`; and reconciled `README.md`, all FDE `docs/`, and OpenSpec deltas.

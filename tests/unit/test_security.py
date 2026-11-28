@@ -504,7 +504,7 @@ def test_masker_redacts_all_seeded_names_and_delivery_addresses_from_seed_sql() 
     addresses = sorted(
         set(
             re.findall(
-                r"\('[^']+@[^']+',\s+'([^']+)',\s+'(?:PROCESSING|SHIPPED|DELIVERED|CANCELLED|RETURNED)'",
+                r"\((?:\d+,\s+)?'[^']+@[^']+',\s+'([^']+)',\s+'(?:PROCESSING|SHIPPED|DELIVERED|CANCELLED|RETURNED)'",
                 seed_sql,
             )
         )

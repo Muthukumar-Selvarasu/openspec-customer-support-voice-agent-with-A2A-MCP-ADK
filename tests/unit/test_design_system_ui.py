@@ -102,3 +102,47 @@ def test_tab_hold_prevents_default_on_repeat():
     idx_prevent = ui_js.index("event.preventDefault();")
     idx_repeat = ui_js.index("if (event.repeat) return;")
     assert idx_prevent < idx_repeat
+
+
+def test_architecture_phoenix_url_injection_and_guardrail_labels(monkeypatch):
+    import src.api.web as web
+
+    monkeypatch.setenv("PHOENIX_PUBLIC_URL", "https://phoenix.example.com/")
+    resp = client.get("/architecture")
+    assert resp.status_code == 200
+    assert 'href="https://phoenix.example.com"' in resp.text
+    assert 'href="http://localhost:6006"' not in resp.text
+    assert "guardrail (L1–L3)" in resp.text
+
+    monkeypatch.delenv("PHOENIX_PUBLIC_URL", raising=False)
+    monkeypatch.delenv("PHOENIX_URL", raising=False)
+    default_resp = client.get("/architecture")
+    assert default_resp.status_code == 200
+    assert 'href="http://localhost:6006"' in default_resp.text
+
+    for name, info in web.TOOLS.items():
+        if info.get("kind") == "MCP":
+            assert "MCP Toolbox" in info["path"], name
+            assert "Toolbox :5000" not in info["path"], name
+
+    svg_resp = client.get("/architecture.svg")
+    assert svg_resp.status_code == 200
+    svg = svg_resp.text
+    assert "gemini-3.1-flash-live-preview" in svg
+    assert "gemini-3.1-flash-lite" not in svg
+    for token in (
+        "GUARDRAIL",
+        "GUARDRAIL · A2A",
+        "length &amp; char whitelist",
+        "Guardrail L1 · in-process",
+        "Security &amp; Topic Judge",
+        "Guardrail L2 · security + scope",
+        "local regex · :10003",
+        "Guardrail L3 · PII scrub",
+    ):
+        assert token in svg, token
+
+    css = client.get("/theme.css").text
+    assert "(light default)" in css
+    assert "(light-only)" not in css
+    assert ".ds-aurora-wrap" not in css

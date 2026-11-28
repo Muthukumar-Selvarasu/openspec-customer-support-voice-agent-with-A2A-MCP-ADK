@@ -46,10 +46,19 @@ host_port_busy() {
   return 1
 }
 
+compose_file() {
+  if [[ -f compose.runtime.yaml ]]; then
+    printf '%s\n' "compose.runtime.yaml"
+  else
+    printf '%s\n' "compose.yaml"
+  fi
+}
+
 # macOS Control Center keeps host port 5000 even when AirPlay Receiver is off.
 # Compose still declares "5000:5000". When that bind would fail, start from a
 # runtime file that leaves Toolbox on container port 5000 without a host publish.
 compose_up() {
+  local phoenix="${1:-${PHOENIX:-true}}"
   local file="compose.yaml"
   if host_port_busy 5000; then
     echo "Host port 5000 is in use. Toolbox listens on 0.0.0.0:5000 in the compose network and is not published on the host." >&2
@@ -65,7 +74,14 @@ PY
   else
     rm -f compose.runtime.yaml
   fi
-  compose -f "$file" up -d --build postgres mcp-toolbox a2a web phoenix
+  local services=(postgres mcp-toolbox a2a web)
+  local phoenix_norm
+  phoenix_norm="$(printf '%s' "$phoenix" | tr '[:upper:]' '[:lower:]')"
+  case "$phoenix_norm" in
+    0|false|no|off) ;;
+    *) services+=(phoenix) ;;
+  esac
+  compose -f "$file" up -d --build "${services[@]}"
 }
 
 gen_config_files() {
@@ -150,7 +166,7 @@ tools:
         description: The authenticated user's email.
       - name: action_type
         type: string
-        description: The action type, for example CANCEL_ORDER, RETURN_ORDER, UPDATE_ADDRESS, UPDATE_PROFILE.
+        description: The action type, for example UPDATE_ORDER_STATUS, RETURN_ITEM, UPDATE_DELIVERY_ADDRESS, UPDATE_PROFILE_DETAILS.
       - name: parameters
         type: string
         description: >
@@ -179,18 +195,30 @@ EOF
 
 usage() {
   cat <<'EOF'
-Usage: ./run.sh [setup|up|down|ps|cli]
+Usage: ./run.sh [setup|up|down|ps|cli] [--no-phoenix]
 
-  setup   Write .run/tools.yaml (Postgres host `postgres`) and a host .env if missing
-  up      podman compose up -d (default)
-  down    podman compose down
-  ps      podman compose ps
-  cli     podman compose run --rm cli python -m src.api.cli
+  setup          Write .run/tools.yaml (Postgres host `postgres`) and a host .env if missing
+  up             podman compose up -d (default; pass --no-phoenix or PHOENIX=false to skip Phoenix)
+  down           podman compose down (uses compose.runtime.yaml when present)
+  ps             podman compose ps (uses compose.runtime.yaml when present)
+  cli            podman compose run --rm cli python -m src.api.cli
 EOF
 }
 
 main() {
-  local cmd="${1:-up}"
+  local phoenix="${PHOENIX:-true}"
+  local args=()
+  for arg in "$@"; do
+    if [[ "$arg" == "--no-phoenix" ]]; then
+      phoenix="false"
+    else
+      args+=("$arg")
+    fi
+  done
+  local cmd="up"
+  if [[ ${#args[@]} -gt 0 ]]; then
+    cmd="${args[0]}"
+  fi
   case "$cmd" in
     setup)
       gen_config_files
@@ -198,21 +226,22 @@ main() {
     up|start)
       require_podman
       gen_config_files
-      compose_up
+      compose_up "$phoenix"
       ;;
     down)
       require_podman
-      compose down
+      compose -f "$(compose_file)" down
+      rm -f compose.runtime.yaml
       ;;
     ps)
       require_podman
-      compose ps
+      compose -f "$(compose_file)" ps
       ;;
     cli)
       require_podman
       gen_config_files
       # podman compose run --rm cli python -m src.api.cli
-      compose run --rm cli python -m src.api.cli
+      compose -f "$(compose_file)" run --rm cli python -m src.api.cli
       ;;
     -h|--help|help)
       usage
@@ -220,7 +249,7 @@ main() {
     *)
       require_podman
       gen_config_files
-      compose "$@"
+      compose -f "$(compose_file)" "${args[@]}"
       ;;
   esac
 }

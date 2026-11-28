@@ -12,6 +12,7 @@ def main(ctx=None):
         "mcp-toolbox",
         build={"builder": "DOCKERFILE", "dockerfilePath": "Dockerfile.toolbox"},
         start="node scripts/start-toolbox.mjs",
+        healthcheck="/",
         env={
             "PORT": "5000",
             "DATABASE_URL": preserve(),
@@ -21,6 +22,7 @@ def main(ctx=None):
         "a2a-judge",
         build={"builder": "DOCKERFILE", "dockerfilePath": "Dockerfile"},
         start="python -m src.a2a.run_servers",
+        healthcheck="/.well-known/agent.json",
         env={
             "A2A_ONLY": "judge",
             "HOST": "0.0.0.0",
@@ -32,6 +34,7 @@ def main(ctx=None):
         "a2a-masker",
         build={"builder": "DOCKERFILE", "dockerfilePath": "Dockerfile"},
         start="python -m src.a2a.run_servers",
+        healthcheck="/.well-known/agent.json",
         env={
             "A2A_ONLY": "masker",
             "HOST": "0.0.0.0",
@@ -41,9 +44,11 @@ def main(ctx=None):
     phoenix = service(
         "phoenix",
         source=image("arizephoenix/phoenix:version-22.0.1"),
+        healthcheck="/",
         env={
             "PORT": "6006",
-            "PHOENIX_ENABLE_AUTH": "false",
+            "PHOENIX_ENABLE_AUTH": "true",
+            "PHOENIX_SECRET": preserve(),
         },
     )
     web = service(
@@ -62,7 +67,8 @@ def main(ctx=None):
             "A2A_MASK_HOST": "${{a2a-masker.RAILWAY_PRIVATE_DOMAIN}}",
             "A2A_MASK_PORT": "${{a2a-masker.PORT}}",
             "PHOENIX_URL": _private("phoenix"),
-            "PHOENIX_PUBLIC_URL": _private("phoenix"),
+            "PHOENIX_PUBLIC_URL": "https://${{phoenix.RAILWAY_PUBLIC_DOMAIN}}",
+            "PHOENIX_API_KEY": preserve(),
             "TELEMETRY": "true",
             "MASK": "true",
         },

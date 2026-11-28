@@ -7,7 +7,7 @@
 | **Inputs** | [`docs/02-problem-metrics.md`](02-problem-metrics.md) |
 | **Attendees** | Client Operations Lead, Client InfoSec Officer, Client AI Platform Lead, FDE Team |
 | **Sign-Off Owners** | Client End-User Champions, Client Product Owner & FDE Lead |
-| **Decision** | **GO to Stage 4/5 (OpenSpec Engineering & Hardening)** — with 6 tracked engineering fixes |
+| **Decision** | **GO to Stage 4/5 (OpenSpec Engineering & Hardening)** — all 6 prototype defects subsequently resolved in OpenSpec Changes `01`–`16` |
 
 ---
 
@@ -15,70 +15,71 @@
 
 ### 1.1 PoC Objective
 
-Before committing to full Stage 4/5 production engineering and cloud deployment, the **Stage 3 Proof of Concept (PoC)** validates whether a **Cascade Voice & Text Architecture** (`STT → Sanitizer → A2A Security Judge → ADK Support Agent + MCP Toolbox + Mem0 → A2A Data Masker → TTS`) can satisfy the Customer's security, privacy, latency, and observability requirements on the 10-user / 17-order seed dataset.
+Before committing to full Stage 4/5 production engineering and cloud deployment, the **Stage 3 Proof of Concept (PoC)** validates whether a **Cascade Voice & Text Architecture** (`Live STT → Guardrail L1 Sanitizer & Blocker → Guardrail L2 A2A Security & Topic Judge → ADK Support Agent + MCP Toolbox + Mem0 → Guardrail L3 Local-Regex A2A Data Masker → TTS`) can satisfy the Customer's security, privacy, latency, and observability requirements on the 10-user / 17-order seed dataset.
 
 ### 1.2 Core Technical Assumptions Being Tested
 
 | Assumption ID | Hypothesis Under Test | How We Test It in the PoC | Target Metric Reference |
 | :--- | :--- | :--- | :--- |
-| **HYP-01 (Cascade Security Gate)** | Transcribing speech to text first allows an isolated A2A Security Judge (`:10002`) and regex blocker to intercept 100% of SQLi, XSS, command injection, and prompt jailbreak payloads before the ADK agent or MCP database tools are ever invoked. | Run the 100-scenario adversarial benchmark (`61` malicious + `39` legitimate) and live SQL injection prompts (`'; DROP TABLE users; --`) via Web Chat, Voice, and CLI. | `MET-SEC-01` (100% block), `MET-SEC-02` (100% pass) |
-| **HYP-02 (Voice Turn-Taking & Multi-Burst Settle)** | Client-side energy VAD (`VAD_RMS = 0.02`, `1500 ms` silence) combined with a server-side `1500 ms` accumulate-and-combine settle timer allows callers to pause naturally mid-sentence without firing premature agent turns, while still supporting `< 200 ms` barge-in interruption. | Speak multi-clause queries (*"What is the status of my order..."* + `800 ms` pause + *"...and show me last month's orders"*) and interrupt the agent mid-reply over `/voice/ws`. | `MET-LAT-03`, `UX-02` |
-| **HYP-03 (Streaming TTS vs. Buffered PII Masking)** | Sentence-by-sentence streaming TTS (`MASK=false`, `AGENT_RESPONSE_STREAM=true`) can achieve sub-2-second Time to First Audio (TTFA) after settle, while buffered PII masking (`MASK=true`) reliably prevents any unmasked PII from being spoken aloud. | Benchmark `/voice/ws` `timing.stages.tts_start` under both `MASK=false` + `AGENT_RESPONSE_STREAM=true` and `MASK=true`. | `MET-LAT-01` (`< 2.0s`), `MET-LAT-02` (`< 6.0s`), `MET-PRIV-02` |
-| **HYP-04 (Audit-Only Order Mutations)** | Even when the restricted `update-order-status` tool is loaded in the MCP toolset (`cs_agent_tools`), the ADK agent (`gemini-3.8-flash`) will follow the **Read → Confirm → `action-log`** policy without mutating `customer_orders`. | Execute multi-turn cancellation, return, and delivery address update scenarios for seeded accounts (`alice.jones@example.com`, `bob.smith@techmail.com`, `julia.child@kitchen.com`). | `MET-SEC-04`, `MET-ACC-01` |
-| **HYP-05 (Glass-Box Inspector & Live Topology)** | Streaming NDJSON/WebSocket step events (`stage`, `step`, `llm`, `tool_call`, `tool_result`, `timing`, `cost`) alongside `BroadcastChannel('cs-agent')` gives engineers real-time visibility into SQL queries, rows returned, token costs, and Arize Phoenix traces. | Run side-by-side browser tabs (`/` and `/architecture`) during live voice and text turns with `TELEMETRY=true`. | `MET-OBS-01`, `MET-OBS-02`, `UX-03` |
+| **HYP-01 (Cascade Security & Scope Gate)** | Transcribing speech to text first allows Guardrail L1 (`src/security/sanitizer.py`, `src/security/blocker.py`) and Guardrail L2 A2A Security & Topic Judge (`:10002`) + `SQL_PROMPT_INSTRUCTION` scope to intercept 100% of SQLi, XSS, command injection, prompt jailbreaks, and out-of-scope prompts before database tools are invoked. | Run [`tests/evals/test_security_eval.py`](../tests/evals/test_security_eval.py) (`61` malicious + `39` legitimate) plus live SQLi (`'; DROP TABLE users; --`) and off-topic probes via Web Chat, Voice, and [`src/api/cli.py`](../src/api/cli.py). | `MET-SEC-01` (100% block), `MET-SEC-02` (100% pass), `SCOPE-01` |
+| **HYP-02 (Push-to-Talk, Settle & Barge-In)** | Live streaming STT (`gemini-3.1-flash-live-preview`) with Push-to-Talk (`#mic` / `Tab`, `PTT_RELEASE_TAIL_MS = 1000`, `0 ms` commit settle), non-PTT settle (`400 ms` Quick / `1500 ms` Explain), and echo-resistant barge-in (`BARGE_RMS = 0.12`) delivers responsive voice turns without premature cutoffs. | Speak single- and multi-clause queries via Push-to-Talk and VAD over `/voice/ws`, and interrupt the agent mid-reply. | `MET-LAT-03`, `UX-02` |
+| **HYP-03 (Sentence-Level Masked Streaming vs. Unmasked Streaming)** | Sentence-level masked voice streaming (`MASK=true`) prevents any unmasked PII from being spoken aloud while keeping time-to-first-audio responsive, and Quick / unmasked streaming (`MASK=false`, `AGENT_RESPONSE_STREAM=true`) achieves sub-2-second TTFA. | Benchmark `/voice/ws` `timing.stages.tts_start` and `total_response` (`stt + answer_sec`) under both Explain (`MASK=true`) and Quick (`MASK=false`). | `MET-LAT-01` (`< 2.0s`), `MET-LAT-02` (`< 6.0s`), `MET-PRIV-02` |
+| **HYP-04 (Audit-Only Order Mutations)** | Even when the restricted `update-order-status` tool is loaded in the MCP toolset (`cs_agent_tools`), the ADK agent (`gemini-3.8-flash`) and `_enforce_tenant_tool_callback` enforce the **Read → Confirm → `action-log`** policy without mutating `customer_orders`. | Execute multi-turn cancellation, return, and delivery address update scenarios for seeded accounts (`alice.jones@example.com`, `bob.smith@techmail.com`, `julia.child@kitchen.com`). | `MET-SEC-04`, `MET-ACC-01` |
+| **HYP-05 (Glass-Box Inspector & Live Topology)** | Streaming NDJSON/WebSocket step events (`stage`, `step`, `llm`, `tool_call`, `tool_result`, `timing`, `cost`) alongside `BroadcastChannel('cs-agent')` gives engineers real-time visibility into SQL queries, rows returned, token costs ([`src/voice/cost.py`](../src/voice/cost.py)), and standalone Arize Phoenix traces. | Run side-by-side browser tabs (`/` and `/architecture`) during live voice and text turns with `TELEMETRY=true`. | `MET-OBS-01`, `MET-OBS-02`, `UX-03` |
 
 ### 1.3 PoC Scope & Sandbox Topology
 
-The PoC vertical slice runs locally via `./run.sh` across 5 processes:
-1. **PostgreSQL 15+ (`127.0.0.1:5432`)**: Seeded with `users` (10 accounts), `customer_orders` (17 orders), and `actions_log`.
-2. **MCP Toolbox (`127.0.0.1:5000`)**: Serving `get-order-status`, `find-customer-orders`, `action-log`, and `update-order-status`.
-3. **A2A SecurityServers (`localhost:10002` & `localhost:10003`)**: JSON-RPC 2.0 Security Judge and Data Masker.
-4. **FastAPI Web & Voice App (`127.0.0.1:8000`)**: Serving `/` (Chat + Voice UI), `/architecture` (Live SVG Diagram), `/api/chat/stream`, and `/voice/ws`.
-5. **Arize Phoenix (`localhost:6006`)**: In-process OpenTelemetry trace collector and UI.
+The local stack runs via Podman (`./run.sh`, supporting `PHOENIX=false` / `--no-phoenix`) across 5 services:
+1. **PostgreSQL 16 (`127.0.0.1:5432`)**: Seeded idempotently via [`mcp_toolbox/seed.sql`](../mcp_toolbox/seed.sql) with `users` (10 accounts), `customer_orders` (17 orders), and `actions_log`.
+2. **MCP Toolbox (`127.0.0.1:5000`, or internal-only via `compose.runtime.yaml` on macOS port-5000 conflict)**: Serving `get-order-status`, `find-customer-orders`, `action-log`, and `update-order-status`.
+3. **A2A Security Servers (`localhost:10002` & `localhost:10003`)**: JSON-RPC 2.0 Security & Topic Judge and local-regex Data Masker (`python -m src.a2a.run_servers`).
+4. **FastAPI Web & Voice App (`127.0.0.1:8000`)**: Serving `/` (Chat + Voice UI), `/architecture` (Live SVG Diagram with Guardrail L1–L3 badges and `PHOENIX_PUBLIC_URL` link), `/api/chat/stream`, and `/voice/ws`.
+5. **Standalone Arize Phoenix (`127.0.0.1:6006`, optional)**: `arizephoenix/phoenix:version-22.0.1` OpenTelemetry trace collector and UI (authenticated on Railway with `PHOENIX_ENABLE_AUTH=true`).
 
 ### 1.4 Scripted PoC Validation Scenarios
 
 1. **Scenario 1 — Standard Shopper Order Lookup & History (`alice.jones@example.com`):**
-   - Sign in → verify greeting (`Hi Alice Jones!`) → click starter chip *"Show me all my orders"* → verify `find-customer-orders` SQL and 4 returned orders in `"What happened"`.
+   - Sign in using the static demo login hint → verify greeting (`Hi Alice Jones!`) → click starter chip *"Show me all my orders"* → verify `find-customer-orders` SQL and 4 returned orders in `"What happened"`.
 2. **Scenario 2 — Premium Shopper Tier Recognition (`julia.child@kitchen.com`):**
-   - Sign in → verify `premium` badge in Web UI header and item-count recognition (`75 items purchased`) in Terminal CLI.
+   - Sign in → verify plain-text ` · premium` header indicator in Web UI and 2-stage CLI item-count recognition (`75 items purchased`) in [`src/api/cli.py`](../src/api/cli.py).
 3. **Scenario 3 — Two-Turn Order Cancellation with Audit Log (`alice.jones@example.com`):**
-   - Ask *"Cancel my processing order"* → verify agent reads Order #4 (`USB-C Hub`) and asks for confirmation → reply *"Yes, please confirm"* → verify `action-log` insert and unchanged `customer_orders` table.
+   - Ask *"Cancel my processing order"* → verify agent reads Order #4 (`USB-C Hub`) and asks for confirmation → reply *"Yes, please confirm"* → verify `action-log` insert (`UPDATE_ORDER_STATUS`) and unchanged `customer_orders` table.
 4. **Scenario 4 — Cross-Customer Order Probe (`alice.jones@example.com` querying Order `#5`):**
-   - Ask *"What is the status of order 5?"* (Bob Smith's order) → verify whether any cross-tenant data leaks in prose or `tool_result`.
-5. **Scenario 5 — Live SQL Injection Block:**
-   - Send *"'; DROP TABLE users; --"* → verify A2A Security Judge blocks the turn (`BLOCKED`), `/architecture` Judge node turns red, and core agent is never called.
-6. **Scenario 6 — Real-Time Cascade Voice & Barge-In:**
-   - Speak multi-burst query via browser mic → inspect STT, Judge, Agent, Masker, TTS latency and USD cost → test mid-sentence barge-in.
+   - Ask *"What is the status of order 5?"* (Bob Smith's order) → verify `0 rows` returned in `tool_result` and neutral anti-enumeration prose.
+5. **Scenario 5 — Live SQL Injection & Off-Topic Scope Gate:**
+   - Send *"'; DROP TABLE users; --"* → verify Guardrail L1/L2 blocks the turn (`BLOCKED`), `/architecture` Judge/Sanitizer node turns coral (`blocked`), and core agent is never called.
+   - Send an off-topic question (e.g., *"Who won the World Cup?"*) → verify Guardrail L2 returns `OFF_TOPIC` and redirects back to customer support.
+6. **Scenario 6 — Real-Time Cascade Voice, Push-to-Talk & Barge-In:**
+   - Hold `#mic` or `Tab` to speak a query → inspect Live STT (`gemini-3.1-flash-live-preview`), Judge, Agent, sentence-level local-regex Masker, TTS latency (`total_response = stt + answer_sec`) and USD cost → test mid-sentence barge-in (`BARGE_RMS = 0.12`).
 
 ---
 
 ## 2. PoC Validation Log & Go/No-Go Decision
 
-### 2.1 PoC Hypothesis Validation Results
+### 2.1 PoC Hypothesis Validation Results (and Stage 4/5 Defect Resolutions)
 
-| Hypothesis | Result | Measured Evidence in PoC Sandbox | Engineering Action Required for Stage 4/5 |
-| :--- | :--- | :--- | :--- |
-| **HYP-01: Pre-Agent Security Gate** | **PARTIAL PASS** | • Live SQLi (`'; DROP TABLE users; --`), XSS, and command injection are blocked before reaching the core agent.<br>• `\brm\b` word boundary works: *"Yes, please confirm"* passes cleanly.<br>• **Bug Found #1:** In `blocker.py` line 316, `self._preprocess_query(query)` is called without assigning its return value, discarding URL-decode and leetspeak normalization.<br>• **Bug Found #2:** In `sanitizer.py` line 11, `ALLOWED_CHARS` strips `<`, `%`, `/`, and `;` *before* `SecurityBlocker` runs, and over-broad `select` regexes can match the English word *"select"*. | Fix `blocker.py` to evaluate both raw and preprocessed strings; refine regex word boundaries in Stage 4 OpenSpec change. |
-| **HYP-02: Voice Multi-Burst & Barge-In** | **PASS** | • Client energy VAD (`16 kHz`, `2048`-sample frames) + server `1500 ms` settle timer cleanly combines multi-burst speech into a single `partial_transcript` bubble.<br>• Barge-in (`BARGE_RMS = 0.05` after `400 ms` grace) stops browser audio immediately and cancels the server task (`turn_end` with `reason: "interrupted"`). | Preserve voice turn-taking protocol unchanged during Stage 4 migration. |
-| **HYP-03: Streaming TTS vs. Buffered PII Masking** | **PARTIAL PASS** | • Safety interlock (`STREAM_ENABLED = AGENT_RESPONSE_STREAM and not MASK`) works as designed.<br>• Streaming mode (`MASK=false`, `AGENT_RESPONSE_STREAM=true`) achieves **`1.3s – 1.8s` TTFA** after settle.<br>• **Bug Found #3:** When `GOOGLE_CLOUD_PROJECT` is unset, `masker.py` logs a warning and returns text **unmasked** while still spending ~3–5s calling the A2A Masker LLM.<br>• **Bug Found #4:** `masker.py` slices Python `str` using UTF-8 byte offsets, shifting characters whenever multibyte punctuation (`—`, `…`) is present. | Replace GCP Cloud DLP in `masker.py` with self-contained deterministic 16-PII redaction + character-safe replacement so `MASK=true` masks for real without `GOOGLE_CLOUD_PROJECT`. |
-| **HYP-04: Tenant Isolation & Audit-Only Mutations** | **PARTIAL PASS** | • **Audit-Only Write:** Agent consistently reads state first, asks for confirmation, and writes to `actions_log` without calling `update-order-status`.<br>• **Bug Found #5 (Critical IDOR Leak in UI):** When `alice.jones@example.com` asks *"What is the status of order 5?"*, `get-order-status` runs `WHERE order_id = $1` (no email filter) and returns Bob Smith's row (`bob.smith@techmail.com`, `88 Tech Ave, Seattle`). Even though the LLM replies *"I can't find this order in your account"*, `web.py` streams the raw `tool_result` row to Alice's `"What happened"` browser panel! | Add tenant scoping (`customer_email`) and deterministic ADK `before_tool_callback` in Stage 4 OpenSpec so cross-tenant rows never leave PostgreSQL or reach `tool_result`. |
-| **HYP-05: Glass-Box Inspector, Topology & Telemetry** | **PASS** | • `"What happened"` panel accurately renders STT, Sanitizer, A2A Judge, Gemini token counts, highlighted SQL (`<mark>$1</mark>`), formatted result tables, A2A Masker, TTS stats, and Phoenix trace deep links.<br>• `/architecture` lights up SVG nodes in real time via `BroadcastChannel('cs-agent')`. | Parameterize `PHOENIX_URL` / `PHOENIX_PUBLIC_URL` and service hosts so the exact same observability works on Railway. |
+| Hypothesis | PoC Result | Evidence Observed & Subsequent OpenSpec Resolution |
+| :--- | :--- | :--- |
+| **HYP-01: Pre-Agent Security & Scope Gate** | **PARTIAL PASS → RESOLVED** | • Live SQLi (`'; DROP TABLE users; --`), XSS, and command injection blocked; `\brm\b` lets *"Yes, please confirm"* pass.<br>• **Prototype Bugs #1 & #2 (Resolved in Changes `03` & `13`):** Prototype `blocker.py` discarded `_preprocess_query(query)` and ran only after stripping characters. Now [`src/security/blocker.py`](../src/security/blocker.py) evaluates both raw and preprocessed strings, `src/api/web.py` / `src/api/cli.py` screen raw input before sanitization, and Guardrail L2 Judge enforces `ALLOW`/`BLOCKED`/`OFF_TOPIC` alongside `SQL_PROMPT_INSTRUCTION` scope (`100/100` in [`tests/evals/test_security_eval.py`](../tests/evals/test_security_eval.py)). |
+| **HYP-02: Voice Push-to-Talk, Settle & Barge-In** | **PASS → ENHANCED** | • Client capture (`16 kHz`, `2048`-sample frames) + Live STT (`gemini-3.1-flash-live-preview`, upgraded in Change `11` & hardened in Change `14`) with Push-to-Talk (`PTT_RELEASE_TAIL_MS = 1000`, `0 ms` commit settle), non-PTT settle (`400 ms` Quick / `1500 ms` Explain), and echo-resistant barge-in (`BARGE_RMS = 0.12`, `400 ms` grace) stops browser audio immediately and cancels the server task (`turn_end` with `reason: "interrupted"`). |
+| **HYP-03: Masked Voice Streaming vs. Unmasked Streaming** | **PARTIAL PASS → RESOLVED** | • **Prototype Bugs #3 & #4 (Resolved in Changes `03`, `04`, `13`, `14`):** Prototype `masker.py` no-op'd without `GOOGLE_CLOUD_PROJECT` and sliced strings with UTF-8 byte offsets. Now [`src/security/masker.py`](../src/security/masker.py) performs character-safe local regex redaction across all 16 PII types (zero GCP SDK, zero LLM calls) with 100% recall on seeded shopper data, and `src/voice/router.py` runs sentence-level masked streaming when `MASK=true` so no unmasked PII is spoken aloud. |
+| **HYP-04: Tenant Isolation & Audit-Only Mutations** | **PARTIAL PASS → RESOLVED** | • **Audit-Only Write:** Agent reads state first, asks for confirmation, and writes to `actions_log` without calling `update-order-status`.<br>• **Prototype Bug #5 — Critical IDOR Leak in UI (Resolved in Changes `01`, `06`, `13`):** Prototype `get-order-status` filtered only `WHERE order_id = $1`, leaking Bob's row into Alice's `"What happened"` panel. Now `mcp_toolbox/tools.yaml` filters `WHERE order_id = $1 AND customer_email = $2` and `_enforce_tenant_tool_callback` forces session identity and hard-blocks `update-order-status`. |
+| **HYP-05: Glass-Box Inspector, Topology & Telemetry** | **PASS → HARDENED** | • `"What happened"` panel renders Live STT, Sanitizer, A2A Judge, Gemini token counts, `MCP Toolbox` call path, highlighted SQL (`<mark>$1</mark>`), formatted tables, local-regex Masker, TTS stats, and non-blocking Phoenix trace links.<br>• `/architecture` lights up SVG nodes in real time via `BroadcastChannel('cs-agent')` using design-system teal (`active`/`done`), coral (`blocked`), and green `GUARDRAIL` L1–L3 badges, and resolves `"Open Phoenix"` dynamically from `PHOENIX_PUBLIC_URL` (Changes `12`, `14`, `15`, `16`). |
 
-### 2.2 Channel Parity Audit (Web/Voice vs. Terminal CLI)
+### 2.2 Channel Parity Audit (Web/Voice vs. Terminal CLI — Resolved)
 
-During PoC validation, we compared `web.py` against `agent_cli.py` and logged three channel divergences to resolve in Stage 4:
+During PoC validation, we compared the web app against the prototype CLI (`agent_cli.py`) and resolved all three divergences when building [`src/api/cli.py`](../src/api/cli.py) (Changes `06`, `13`, `14`):
 
-1. **Sanitized Input Drop in CLI:** `agent_cli.py` calls `validate_input(user_input)`, which sanitizes a local variable, returns `True`, and then passes the **unsanitized** `user_input` to `runner.run()`. `web.py` passes the sanitized `clean` string.
-2. **Forced Lowercase in CLI:** `agent_cli.py` runs `lower_masked = masked.lower()` before printing the assistant response, stripping all proper nouns and sentence casing.
-3. **Prompt Parameter Typo:** `prompts.py` instructs the agent to pass `parameters_json` to `action-log`, while `tools.yaml` defines the parameter as `parameters`.
+1. **Sanitized Input Drop in CLI → Resolved:** `src/api/cli.py` `validate_input()` screens raw + sanitized input, returns `clean`, and `run_turn()` passes `clean` to `runner.run()`.
+2. **Forced Lowercase in CLI → Resolved:** `src/api/cli.py` preserves original masker casing (no `.lower()`).
+3. **Prompt Parameter Typo & Loader Drift → Resolved:** [`src/core/prompts.py`](../src/core/prompts.py), [`mcp_toolbox/tools.yaml`](../mcp_toolbox/tools.yaml), and [`run.sh`](../run.sh) align on `parameters` and canonical `action_type` names (`UPDATE_ORDER_STATUS`, `RETURN_ITEM`, `UPDATE_DELIVERY_ADDRESS`, `UPDATE_PROFILE_DETAILS`), and `src/api/cli.py` uses a streamlined 2-stage startup loader (`[1/2] Authenticating user`, `[2/2] Loading previous actions`).
 
 ### 2.3 Formal Stage 3 Go / No-Go Decision
 
-- **Decision:** **GO — Proceed to Stage 4/5 (Spec-Driven Engineering with `openspec/`)**
+- **Decision:** **GO — Proceeded to Stage 4/5 (Spec-Driven Engineering with `openspec/`)**
 - **Rationale:**
-  1. The core **Cascade Voice & Text architecture**, **A2A JSON-RPC 2.0 microservice protocol**, **MCP Toolbox integration**, **Mem0 cross-session memory**, and **Glass-Box UI + Live Architecture SVG** are proven and highly effective.
-  2. All 6 identified defects (cross-tenant `tool_result` leak, `GOOGLE_CLOUD_PROJECT` no-op masker, discarded `_preprocess_query`, CLI sanitization/lowercase drift, `parameters_json` prompt typo, and hardcoded localhost URLs) are well-bounded and ready to be fixed systematically through **OpenSpec specs and changes**.
+  1. The core **Cascade Voice & Text architecture**, **A2A JSON-RPC 2.0 microservice protocol**, **MCP Toolbox integration**, **Mem0 cross-session memory**, and **Glass-Box UI + Live Architecture SVG** were proven effective.
+  2. All 6 prototype defects (cross-tenant `tool_result` leak, `GOOGLE_CLOUD_PROJECT` no-op masker, discarded `_preprocess_query`, CLI sanitization/lowercase drift, `parameters_json` prompt typo, and hardcoded localhost URLs) were resolved systematically through OpenSpec changes `01`–`16`.
 
 ---
 
@@ -86,33 +87,27 @@ During PoC validation, we compared `web.py` against `agent_cli.py` and logged th
 
 ### 3.1 Live Demo Walkthrough Summary
 
-The FDE team demonstrated the end-to-end PoC across **Web Chat (`/`)**, **Live Architecture View (`/architecture`)**, **Real-Time Browser Voice (`/voice/ws`)**, and **Arize Phoenix (`:6006`)**:
+The FDE team demonstrated the end-to-end flow across **Web Chat (`/`)**, **Live Architecture View (`/architecture`)**, **Real-Time Browser Voice (`/voice/ws`)**, and **Arize Phoenix (`:6006`)**:
 
-1. **Quick Demo Sign-In & Starter Chips:**
-   - Signed in as `alice.jones@example.com` and `julia.child@kitchen.com` (showing the `premium` customer badge).
+1. **Demo Sign-In & Starter Chips:**
+   - Signed in as `alice.jones@example.com` and `julia.child@kitchen.com` (using the static demo login hints; Premium accounts display plain-text ` · premium` in the header).
    - Used the starter prompt chips (*"Where is my last order?"*, *"Show me all my orders"*, *"Cancel my processing order"*, *"I want to return order 1"*, *"'; DROP TABLE users; --"*).
 2. **Side-by-Side Live Architecture Visualization:**
-   - Placed `/` and `/architecture` side-by-side. Stakeholders watched the SVG nodes (`User → STT → Sanitizer → Security Judge → ADK Support Agent → MCP Toolbox → PostgreSQL / Mem0 → Data Masker → TTS`) glow cyan (`active`), transition to green (`done`), and flash red (`blocked`) when the SQL injection chip was clicked.
+   - Placed `/` and `/architecture` side-by-side. Stakeholders watched the SVG nodes (`User → Speech to text (gemini-3.1-flash-live-preview) → Sanitizer [GUARDRAIL L1] → Security & Topic Judge [GUARDRAIL L2 · A2A] → Support Agent → MCP Toolbox → PostgreSQL / Mem0 → Data Masker [GUARDRAIL L3 · A2A] → Text to speech`) highlight in **teal** (`active` with flowing dashed edges and `done` outline) and flash **coral** (`blocked`) when the SQL injection chip was clicked, with green **GUARDRAIL** badges and legend clearly marking Layers 1–3.
 3. **"What Happened" Glass-Box Inspector:**
-   - Expanded the step inspector under each assistant turn to show the exact MCP call path, substituted SQL parameters (`$1`), formatted HTML order table with status pills (`DELIVERED`, `SHIPPED`, `PROCESSING`), per-stage latency (`ms`), token counts, USD cost, and the **"View trace in Phoenix ↗"** deep link.
-4. **Cascade Voice & Barge-In:**
-   - Demonstrated multi-burst spoken queries with natural mid-sentence pauses (`1500 ms` settle window), Hold/Resume mic control, and mid-sentence barge-in interruption.
+   - Expanded the step inspector under each assistant turn to show the `MCP Toolbox` call path, substituted SQL parameters (`$1`), formatted HTML order table with status pills (`DELIVERED`, `SHIPPED`, `PROCESSING`), per-stage latency (`ms`), token counts, USD cost, and the **"View trace in Phoenix ↗"** deep link.
+4. **Cascade Voice, Push-to-Talk & Barge-In:**
+   - Demonstrated Push-to-Talk (`#mic` / `Tab` with `1000 ms` release tail and `0 ms` commit settle), sentence-level masked streaming in Explain mode (`MASK=true`), and echo-resistant mid-sentence barge-in (`BARGE_RMS = 0.12`).
 
 ### 3.2 Stakeholder Feedback Captured
 
-#### What the Customer Loved (Keep Unchanged)
-- **"What Happened" SQL & Step Inspector:** Both the Engineering and InfoSec leads highlighted the inline SQL viewer + tabular result renderer as a standout feature that completely solves their "black-box AI" concern.
-- **Live `/architecture` BroadcastChannel Sync:** Operations leadership requested keeping `/architecture` in the final production app for executive demos and operator training.
-- **Accumulate-and-Combine Voice Turn Model:** Callers did not feel rushed when pausing to look up an order number; the growing `partial_transcript` bubble made voice interaction intuitive.
+#### What the Customer Loved (Kept in Production Build)
+- **"What Happened" SQL & Step Inspector:** Both the Engineering and InfoSec leads highlighted the inline SQL viewer + tabular result renderer as a standout feature that solves their "black-box AI" concern.
+- **Live `/architecture` BroadcastChannel Sync:** Operations leadership requested keeping `/architecture` (now upgraded with light/dark design-system tokens, Guardrail L1–L3 badges, and env-driven `"Open Phoenix"` links) in the final production app.
+- **Responsive Cascade Voice Turn-Taking:** Push-to-Talk with live interim transcription and natural settle windows made voice interaction intuitive without rushing callers.
 - **Read-Confirm-Audit Pattern:** Operations confirmed that requiring explicit user confirmation before writing to `actions_log` matches their fulfillment SOP.
 
-#### Customer Requests & Action Items for Stage 4–7 Engineering
-1. **Fix the Cross-Tenant `tool_result` Exposure in the Inspector (InfoSec P0):**
-   - InfoSec noted that while the LLM refused to tell Alice about Bob's Order `#5`, expanding `"What happened"` showed Bob's row returned from `get-order-status`.
-   - **Action Agreed:** Scope `get-order-status` by `customer_email` and enforce session identity in the ADK tool callback so `0 rows` are returned when querying another customer's order ID.
-2. **Make PII Masking Work Without GCP Setup (InfoSec & Platform P0):**
-   - The Customer is deploying on **Railway** and does not want to maintain a separate Google Cloud Project or Service Account JSON (`GOOGLE_CLOUD_PROJECT`) just for DLP masking.
-   - **Action Agreed:** Replace `google-cloud-dlp` in `masker.py` with self-contained 16-PII redaction + Gemini Masker verification so `MASK=true` masks street addresses, emails, phone numbers, and credit cards out-of-the-box using only `GOOGLE_API_KEY`.
-3. **Deploy as Independent Services on Railway (Platform Lead P1):**
-   - Platform Engineering confirmed they want the multi-service topology (`postgres`, `mcp-toolbox`, `a2a-judge`, `a2a-masker`, `web-voice-app`, `phoenix`) deployed to Railway via environment-driven service URLs while keeping `./run.sh` working for local benchmarking.
-
+#### Customer Requests Completed in Stage 4–7 Engineering
+1. **Fix the Cross-Tenant `tool_result` Exposure in the Inspector (InfoSec P0) — Done:** `get-order-status` filters by `(order_id, customer_email)` and `_enforce_tenant_tool_callback` forces session identity so `0 rows` return on cross-tenant lookups.
+2. **Make PII Masking Work Without GCP Setup (InfoSec & Platform P0) — Done:** Replaced `google-cloud-dlp` with deterministic local regexes in [`src/security/masker.py`](../src/security/masker.py) (zero GCP project or LLM dependency).
+3. **Deploy as Independent Services on Railway + Neon (Platform Lead P1) — Done:** Packaged `mcp-toolbox`, `a2a-judge`, `a2a-masker`, `web-voice-app`, and auth-protected `phoenix:version-22.0.1` in [`.railway/railway.py`](../.railway/railway.py) backed by Neon Postgres (`scripts/start-toolbox.mjs` preserving `?sslmode=require`), while keeping `./run.sh` working locally with Podman.
