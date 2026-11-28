@@ -1597,3 +1597,88 @@ async def test_live_transcribe_when_api_key_set() -> None:
 
     text, _usage = await transcribe(b"\x00\x00" * 1600)
     assert isinstance(text, str)
+
+
+def test_live_utterance_pads_trailing_silence_for_burst_audio_and_handles_activity_end(
+    monkeypatch,
+) -> None:
+    import asyncio
+    from types import SimpleNamespace
+
+    from src.voice import stt
+
+    class Session:
+        def __init__(self) -> None:
+            self.audio: list[bytes] = []
+            self.ended = False
+            self.closed = False
+
+        async def send_realtime_input(self, *, audio=None, audio_stream_end=None, **kwargs):
+            if audio is not None:
+                self.audio.append(bytes(audio.data))
+            if audio_stream_end:
+                self.ended = True
+
+        async def receive(self):
+            yield SimpleNamespace(
+                usage_metadata=None,
+                voice_activity=SimpleNamespace(voice_activity_type="ACTIVITY_START"),
+                server_content=SimpleNamespace(),
+            )
+            while not self.closed:
+                if self.ended and len(self.audio) >= 2 and self.audio[-1] == stt._END_SILENCE_PCM:
+                    self.ended = False
+                    yield SimpleNamespace(
+                        usage_metadata=None,
+                        voice_activity=None,
+                        server_content=SimpleNamespace(
+                            input_transcription=SimpleNamespace(
+                                text="What is the status of my latest order?",
+                                finished=False,
+                            ),
+                            interim_input_transcription=None,
+                        ),
+                    )
+                    yield SimpleNamespace(
+                        usage_metadata=None,
+                        voice_activity=SimpleNamespace(voice_activity_type="ACTIVITY_END"),
+                        server_content=SimpleNamespace(),
+                    )
+                    break
+                await asyncio.sleep(0.01)
+            while not self.closed:
+                await asyncio.sleep(0.01)
+
+    session = Session()
+
+    class Connect:
+        async def __aenter__(self):
+            return session
+
+        async def __aexit__(self, *args):
+            session.closed = True
+            return False
+
+    class Client:
+        aio = SimpleNamespace(live=SimpleNamespace(connect=lambda **kwargs: Connect()))
+
+    monkeypatch.setattr(stt, "_client", lambda: Client())
+
+    async def run() -> None:
+        utter = stt.open_utterance()
+        await utter.open()
+        reader = asyncio.create_task(_drain(utter))
+        burst = b"\x01\x02" * 4000
+        await utter.send(burst)
+        text, _usage, nbytes = await utter.flush(reader)
+        await utter.close()
+        reader.cancel()
+        assert text == "What is the status of my latest order?"
+        assert nbytes == len(burst)
+        assert session.audio == [burst, stt._END_SILENCE_PCM]
+
+    async def _drain(utter) -> None:
+        async for _ in utter.updates():
+            pass
+
+    asyncio.run(run())

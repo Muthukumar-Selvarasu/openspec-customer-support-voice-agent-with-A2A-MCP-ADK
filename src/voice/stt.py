@@ -111,6 +111,8 @@ def _live_config() -> types.LiveConnectConfig:
 
 
 _FLUSH_DRAIN_SEC = 0.25
+_BURST_FLUSH_WAIT_SEC = 3.0
+_END_SILENCE_PCM = b"\x00" * 32000  # 1.0 s of 16 kHz mono 16-bit PCM silence for Live VAD
 
 
 class LiveUtterance:
@@ -129,6 +131,7 @@ class LiveUtterance:
         self._seq = 0
         self._last_rx = 0.0
         self._turn_done = False
+        self._vad_active = False
         self._session = None
         self._cm = None
         self._span_cm = None
@@ -145,6 +148,14 @@ class LiveUtterance:
         usage = getattr(message, "usage_metadata", None)
         if usage:
             self.usage = usage
+        va = getattr(message, "voice_activity", None)
+        if va is not None:
+            va_type = str(getattr(va, "voice_activity_type", "") or "").upper()
+            if "ACTIVITY_START" in va_type:
+                self._vad_active = True
+            elif "ACTIVITY_END" in va_type:
+                self._vad_active = False
+                self._turn_done = True
         content = getattr(message, "server_content", None)
         if content is None:
             return None
@@ -215,9 +226,13 @@ class LiveUtterance:
             return ""
         return full
 
-    async def _end_audio(self) -> None:
+    async def _end_audio(self, *, pad_silence: bool = False) -> None:
         try:
             if self._session is not None:
+                if pad_silence:
+                    await self._session.send_realtime_input(
+                        audio=types.Blob(data=_END_SILENCE_PCM, mime_type=_PCM_MIME)
+                    )
                 await self._session.send_realtime_input(audio_stream_end=True)
         except Exception:
             pass
@@ -232,10 +247,16 @@ class LiveUtterance:
             return "", usage, 0
         seq_before = self._seq
         self._turn_done = False
-        await self._end_audio()
+        pad_silence = phrase_bytes >= 3200 and not self._new_piece()
+        await self._end_audio(pad_silence=pad_silence)
         loop = asyncio.get_running_loop()
         start = loop.time()
-        max_wait = _FLUSH_DRAIN_SEC if phrase_bytes < 3200 else 0.7
+        if phrase_bytes < 3200:
+            max_wait = _FLUSH_DRAIN_SEC
+        elif pad_silence:
+            max_wait = _BURST_FLUSH_WAIT_SEC
+        else:
+            max_wait = 0.7
         deadline = start + max_wait
         while loop.time() < deadline:
             piece = self._new_piece()
@@ -246,7 +267,7 @@ class LiveUtterance:
                     break
                 if not self._interim and self._seq == seq_before and (loop.time() - start) >= 0.2:
                     break
-            elif self._turn_done:
+            elif self._turn_done and not pad_silence:
                 break
             if reader is not None and reader.done():
                 break
