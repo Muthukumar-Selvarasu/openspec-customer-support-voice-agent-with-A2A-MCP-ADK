@@ -9,4 +9,8 @@ __pycache__
 openspec
 docs
 backup
+graphify-out
+diagram.png
+test
+viperfish
 *.pyc
